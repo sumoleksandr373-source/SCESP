@@ -52,6 +52,7 @@ static const char *kChamShaders[] = { "Hidden/Internal-Colored", "GUI/Text Shade
 static const char *kBoneSkip[] = { "root", "ik", "target", "pole", "weapon", "gun" };
 // bones further than this from the player pivot are junk (IK helpers, world-origin bones)
 static const float kBelowFeet = 0.3f, kMaxReach = 2.0f;
+static const CGFloat kBarW = 8.0;      // health / armor bar thickness in px (was 15)
 static const float kAimFov = 18.0f;   // degrees: aim lock only grabs targets this close to the crosshair
 
 // ---- aim body-part selection ------------------------------------------------------------
@@ -2394,7 +2395,7 @@ static SCNNode *buildAgentModel() {
                             if (mx < (mi_hp ? 100.f : g_hpRef)) mx = mi_hp ? 100.f : g_hpRef;
                             if (hv > mx) mx = hv;
                             CGFloat ratio = fminf(1.f, hv / mx);
-                            CGFloat bw = 15.0, bx = r.origin.x - bw - 3;     // wide enough for the number inside the bar
+                            CGFloat bw = kBarW, bx = r.origin.x - bw - 3;     // kBarW: bar thickness
                             [hpBack appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(bx - 1, r.origin.y - 1, bw + 2, r.size.height + 2)]];
                             CGFloat fh = r.size.height * ratio;
                             UIBezierPath *tgt = ratio > 0.6 ? hpG : (ratio > 0.3 ? hpY : hpR);
@@ -2405,7 +2406,7 @@ static SCNNode *buildAgentModel() {
                         if (wantArmor && !(hpOk && hpv <= 0.f)) {
                             int av = 0; bool flag = false;
                             if (readArmor(p.obj, av, flag) && av > 0) {
-                                CGFloat bw = 15.0, ax = r.origin.x + r.size.width + 3;
+                                CGFloat bw = kBarW, ax = r.origin.x + r.size.width + 3;
                                 if (av > 0) {
                                     CGFloat ratio = fminf(1.f, (float)av / 100.f);
                                     [hpBack appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(ax - 1, r.origin.y - 1, bw + 2, r.size.height + 2)]];
@@ -2560,7 +2561,7 @@ static SCNNode *buildAgentModel() {
     while (_barLabels.count < bt.size()) {
         UILabel *bl = [[UILabel alloc] init];
         bl.hidden = YES; bl.userInteractionEnabled = NO;
-        bl.font = [UIFont monospacedDigitSystemFontOfSize:8 weight:UIFontWeightHeavy];
+        bl.font = [UIFont monospacedDigitSystemFontOfSize:6.5 weight:UIFontWeightHeavy];
         bl.shadowColor = [UIColor colorWithWhite:0 alpha:0.95]; bl.shadowOffset = CGSizeMake(1, 1);
         [_overlay addSubview:bl]; [_barLabels addObject:bl];
     }
