@@ -52,7 +52,7 @@ static const char *kChamShaders[] = { "Hidden/Internal-Colored", "GUI/Text Shade
 static const char *kBoneSkip[] = { "root", "ik", "target", "pole", "weapon", "gun" };
 // bones further than this from the player pivot are junk (IK helpers, world-origin bones)
 static const float kBelowFeet = 0.3f, kMaxReach = 2.0f;
-static const CGFloat kBarW = 5.0;      // health / armor bar thickness in px (was 15)
+static const CGFloat kBarW = 2.0;      // health / armor bar thickness in px (was 15)
 static const float kAimFov = 18.0f;   // degrees: aim lock only grabs targets this close to the crosshair
 
 // ---- aim body-part selection ------------------------------------------------------------
