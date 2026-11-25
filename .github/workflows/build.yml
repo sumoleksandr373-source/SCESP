@@ -1,0 +1,28 @@
+name: build-dylib
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ["SCESP.mm", ".github/workflows/build.yml"]
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile libSCESP.dylib (iOS arm64)
+        run: |
+          xcrun -sdk iphoneos clang++ -std=c++17 -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -dynamiclib -fobjc-arc -O2 \
+            -install_name @rpath/libSCESP.dylib \
+            -framework Foundation -framework UIKit -framework QuartzCore -framework SceneKit \
+            -o libSCESP.dylib SCESP.mm
+          file libSCESP.dylib
+          ls -la libSCESP.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libSCESP
+          path: libSCESP.dylib
