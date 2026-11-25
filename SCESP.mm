@@ -2626,6 +2626,23 @@ __attribute__((constructor)) static void scesp_init(void) {
         if (!(g_haveYaw && g_havePit)) useDumpFields();
         loadHp();
         g_driver = [SCESPDriver new];
+        // on-screen "loaded" toast (no cable needed): if you see it, the dylib is injected and running
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UIWindow *win = nil;
+            for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+                if (![sc isKindOfClass:UIWindowScene.class]) continue;
+                for (UIWindow *w in ((UIWindowScene *)sc).windows) if (w.isKeyWindow) win = w;
+            }
+            if (!win) return;
+            UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 220, 26)];
+            t.text = @"SCESP v5.9 loaded"; t.textAlignment = NSTextAlignmentCenter;
+            t.font = [UIFont systemFontOfSize:12 weight:UIFontWeightHeavy]; t.textColor = UIColor.whiteColor;
+            t.backgroundColor = [UIColor colorWithRed:0.1 green:0.6 blue:0.2 alpha:0.9];
+            t.layer.cornerRadius = 8; t.clipsToBounds = YES; t.userInteractionEnabled = NO;
+            t.center = CGPointMake(win.bounds.size.width * 0.5, win.safeAreaInsets.top + 30);
+            [win addSubview:t];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [t removeFromSuperview]; });
+        });
         // CoreFoundation is resolved at runtime so the dylib needs no extra link flags.
         cf_obs_create create = (cf_obs_create)dlsym(RTLD_DEFAULT, "CFRunLoopObserverCreateWithHandler");
         cf_main_loop mainLoop = (cf_main_loop)dlsym(RTLD_DEFAULT, "CFRunLoopGetMain");
