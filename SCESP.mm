@@ -1,4 +1,4 @@
-// SCESP.mm v5.8 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
+// SCESP.mm v5.9 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
 //
 // Box / skeleton / chams / box fill / health bar, enemies only (teammates optional), settings panel.
 // Tap the small "ESP" plate (top-left) to open/close the settings panel.
@@ -52,7 +52,7 @@ static const char *kChamShaders[] = { "Hidden/Internal-Colored", "GUI/Text Shade
 static const char *kBoneSkip[] = { "root", "ik", "target", "pole", "weapon", "gun" };
 // bones further than this from the player pivot are junk (IK helpers, world-origin bones)
 static const float kBelowFeet = 0.3f, kMaxReach = 2.0f;
-static const CGFloat kBarW = 2.0;      // health / armor bar thickness in px (was 15)
+static const CGFloat kBarW = 2.0;      // health / armor bar thickness in px (was 15); digit font scales with it
 static const float kAimFov = 18.0f;   // degrees: aim lock only grabs targets this close to the crosshair
 
 // ---- aim body-part selection ------------------------------------------------------------
@@ -1158,7 +1158,7 @@ static std::unordered_map<void *, float> g_hpMax;
 struct DmgPop { void *id; V3 pos; float amount; double t0; };
 struct DmgDraw { CGPoint p; float a, amt, k; };
 // value text inside a bar: x = bar centre, y = bar top; side<0 = hp bar, side>0 = armor bar
-struct BarTxt { CGFloat x, y; int v, side; float ratio; };
+struct BarTxt { CGFloat x, y; int v, side; float ratio; CGFloat h; };
 static std::vector<DmgPop> g_pops;
 static std::unordered_map<void *, float> g_hpPrev;      // last HP seen per character; a drop = damage taken
 static void dmgSpawn(void *id, V3 pos, float amt, double now) {
@@ -2400,7 +2400,7 @@ static SCNNode *buildAgentModel() {
                             CGFloat fh = r.size.height * ratio;
                             UIBezierPath *tgt = ratio > 0.6 ? hpG : (ratio > 0.3 ? hpY : hpR);
                             [tgt appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(bx, r.origin.y + r.size.height - fh, bw, fh)]];
-                            bt.push_back({ bx + bw * 0.5, r.origin.y, (int)lroundf(hv), -1, (float)ratio });
+                            bt.push_back({ bx + bw * 0.5, r.origin.y, (int)lroundf(hv), -1, (float)ratio, r.size.height });
                         }
                         // armor bar: right side of the box, blue (the gold odg() flag dot was removed)
                         if (wantArmor && !(hpOk && hpv <= 0.f)) {
@@ -2412,7 +2412,7 @@ static SCNNode *buildAgentModel() {
                                     [hpBack appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(ax - 1, r.origin.y - 1, bw + 2, r.size.height + 2)]];
                                     CGFloat fh = r.size.height * ratio;
                                     [armPath appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(ax, r.origin.y + r.size.height - fh, bw, fh)]];
-                                    bt.push_back({ ax + bw * 0.5, r.origin.y, av, 1, (float)ratio });
+                                    bt.push_back({ ax + bw * 0.5, r.origin.y, av, 1, (float)ratio, r.size.height });
                                 }
                             }
                         }
@@ -2569,13 +2569,27 @@ static SCNNode *buildAgentModel() {
         UILabel *bl = _barLabels[i];
         if (i >= bt.size()) { bl.hidden = YES; continue; }
         const BarTxt &t = bt[i];
-        bl.text = [NSString stringWithFormat:@"%d", t.v];
-        bl.textColor = UIColor.whiteColor;                        // white on the bar, black shadow keeps it readable on any fill
-        [bl sizeToFit];
-        CGRect f = bl.frame; f.origin.y = t.y;                   // aligned with the top of the bar
-        f.origin.x = (t.side < 0) ? (t.x - kBarW * 0.5 - 2 - f.size.width)   // hp: left of its bar, right-aligned to it
-                                  : (t.x + kBarW * 0.5 + 2);                 // armor: right of its bar
-        bl.frame = f; bl.hidden = NO;
+        // digits stacked top-to-bottom INSIDE the bar: 100 -> 1 / 0 / 0
+        NSString *num = [NSString stringWithFormat:@"%d", t.v];
+        NSUInteger nd = num.length;
+        CGFloat fs = fminf((float)(kBarW * 1.75), fmaxf(2.5f, (float)(t.h - 2.0) / (nd * 1.0f)));   // font follows bar width (heavy digit is ~0.6em wide), shrinks on small / far bars
+        CGFloat lh = fs * 1.0;                                                      // tight line height
+        NSMutableString *stk = [NSMutableString string];
+        for (NSUInteger c = 0; c < nd; c++) [stk appendFormat:@"%@%C", c ? @"\n" : @"", [num characterAtIndex:c]];
+        NSMutableParagraphStyle *ps = [[NSMutableParagraphStyle alloc] init];
+        ps.alignment = NSTextAlignmentCenter;
+        ps.minimumLineHeight = lh; ps.maximumLineHeight = lh;
+        NSShadow *sh = [[NSShadow alloc] init];
+        sh.shadowColor = [UIColor colorWithWhite:0 alpha:0.95]; sh.shadowOffset = CGSizeMake(0.3, 0.3); sh.shadowBlurRadius = 0;
+        bl.numberOfLines = 0;
+        bl.attributedText = [[NSAttributedString alloc] initWithString:stk attributes:@{
+            NSFontAttributeName: [UIFont monospacedDigitSystemFontOfSize:fs weight:UIFontWeightHeavy],
+            NSForegroundColorAttributeName: UIColor.whiteColor,
+            NSParagraphStyleAttributeName: ps,
+            NSShadowAttributeName: sh }];
+        CGFloat bwid = kBarW + 4;                                // a hair of slack so nothing clips
+        bl.frame = CGRectMake(t.x - bwid * 0.5, t.y + 1, bwid, lh * nd);   // centred on the bar, at its top
+        bl.hidden = NO;
     }
     [CATransaction commit];
 
@@ -2584,7 +2598,7 @@ static SCNNode *buildAgentModel() {
         NSMutableString *cs = [NSMutableString string];
         for (int i = 0; i < kN; i++) [cs appendFormat:@"%s%zu", i ? "/" : "", g_counts[i]];
         NSString *sh = g_chamShaderUsed ? [NSString stringWithUTF8String:g_chamShaderUsed] : (g_chamFailed ? @"no shader" : @"-");
-        _status.text = [NSString stringWithFormat:@"v5.8 bars %.0fpx | found %@ | team f%d me%d | draw %d | cam %@\nchams %@ %s %zu re%d | occ %s",
+        _status.text = [NSString stringWithFormat:@"v5.9 bars %.0fpx | found %@ | team f%d me%d | draw %d | cam %@\nchams %@ %s %zu re%d | occ %s",
                         (double)kBarW, cs, g_teamField, myTeam, drawn, camOk ? @"ok" : @"-", [sh lastPathComponent],
                         g_chamMode == 2 ? "noX" : "xray", g_chams.size(), g_chamReapply,
                         g_occOff ? "off" : "on"];
