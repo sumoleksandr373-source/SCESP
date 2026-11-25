@@ -1,4 +1,4 @@
-// SCESP.mm v5.5 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
+// SCESP.mm v5.6 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
 //
 // Box / skeleton / chams / box fill / health bar, enemies only (teammates optional), settings panel.
 // Tap the small "ESP" plate (top-left) to open/close the settings panel.
@@ -13,6 +13,8 @@
 //   character (and stayed put on all others) is stored and read every tick.
 // - armor bar = blue vertical bar right of the box, from PlayerController.odf() (armor int); the gold dot above it is the
 //   odg() armor flag (v24 reverse notes: HUD reads ode/odf/odg together). Meaning of odg() is by data flow, not proven.
+// - bunny hop (v5.6): flips the game's own PlayerCheatParameters._bhop path on the local player via
+//   MovementController.ouk(bool) (state +0x6F; physics branch uses BhopSpeedStep/ResetTime/MaxSpeed). Offline bot matches only.
 // - hot path uses direct method-pointer calls; drawing is 30 fps, scan about once a second
 //
 // Not compiled or run on a device by me. If something misbehaves, the panel's status line says where.
@@ -72,6 +74,7 @@ static NSString *aimPartTitle(int part) {
 // ---- settings --------------------------------------------------------------------------
 struct Settings {
     bool on = true, box = true, skel = true, chams = false, fill = false, team = false, lowcpu = false, noocc = true, aim = false, hp = true, hdot = true;
+    bool bhop = false;      // enable the game's built-in bunny-hop movement flag on the local player
     int color = 0;
     float lw = 1.5f;
     float head = 1.8f;
@@ -105,6 +108,7 @@ static void saveSettings() {
     [d setBool:g_set.noocc forKey:@"scesp_noocc"];
     [d setBool:g_set.hp forKey:@"scesp_hp"];
     [d setBool:g_set.hdot forKey:@"scesp_hdot"];
+    [d setBool:g_set.bhop forKey:@"scesp_bhop"];
     [d setInteger:g_set.color forKey:@"scesp_color"];
     [d setFloat:g_set.lw forKey:@"scesp_lw"];      [d setFloat:g_set.head forKey:@"scesp_head"];
     [d setFloat:g_set.fov forKey:@"scesp_fov"];
@@ -124,6 +128,7 @@ static void loadSettings() {
     g_set.lowcpu = [d boolForKey:@"scesp_low"];
     g_set.noocc = [d objectForKey:@"scesp_noocc"] ? [d boolForKey:@"scesp_noocc"] : true;
     g_set.hdot = [d objectForKey:@"scesp_hdot"] ? [d boolForKey:@"scesp_hdot"] : true;
+    g_set.bhop = [d boolForKey:@"scesp_bhop"];
     g_set.hp = [d objectForKey:@"scesp_hp"] ? [d boolForKey:@"scesp_hp"] : true;
     g_set.color = (int)[d integerForKey:@"scesp_color"];
     g_set.lw = [d floatForKey:@"scesp_lw"];        g_set.head = [d floatForKey:@"scesp_head"];
@@ -342,6 +347,54 @@ static bool g_apiOk = false;
 
 static void *direct(void *methodInfo) { return methodInfo ? *(void **)methodInfo : nullptr; }
 
+// ---- bunny hop ---------------------------------------------------------------------------
+// PlayerController holds its MovementController in an auto-property backing field (typed field, so we find
+// it by TYPE name, which survives obfuscated renames better than the getter name nzr()).
+// MovementController.ouk(bool): this+0x88 -> movement state; writes state+0x6F = flag, clears accumulator +0x70 on off.
+static const char *kMoveType = "Chillow.StandChillow.Player.Movement.MovementController";
+static void *k_move;
+static void *mi_move_bhop;          // MovementController.ouk(bool)
+static void *mi_pc_move;            // PlayerController.nzr() -> MovementController (fallback if the field scan fails)
+static int   g_moveOff = -1;        // PlayerController field offset of the MovementController
+static void *g_bhopLastMove = nullptr;
+static int   g_bhopLastState = -1;  // -1 = never touched, 0/1 = last value we wrote
+static int   g_bhopCount = 0;
+static bool  g_bhopForce = false;
+
+static void resolveBhop(void *game, void *kpc) {
+    k_move = il2_class_from_name(game, "Chillow.StandChillow.Player.Movement", "MovementController");
+    if (k_move) mi_move_bhop = findMethod(k_move, "ouk", 1, "System.Boolean");
+    if (kpc) {
+        mi_pc_move = il2_get_method(kpc, "nzr", 0);
+        void *it = nullptr, *f;
+        while ((f = il2_class_fields(kpc, &it))) {
+            if (il2_field_flags && (il2_field_flags(f) & 0x10)) continue;      // static
+            const char *tn = il2_type_name(il2_field_type(f));
+            if (tn && strcmp(tn, kMoveType) == 0) { g_moveOff = il2_field_offset(f); break; }
+        }
+    }
+    NSLog(@"[SCESP] bhop: MovementController=%p ouk=%p nzr=%p fieldOff=0x%x", k_move, mi_move_bhop, mi_pc_move, g_moveOff);
+}
+static void *localMovement(void *me) {
+    if (!me) return nullptr;
+    if (g_moveOff > 0) return *(void **)((char *)me + g_moveOff);
+    return mi_pc_move ? inv(mi_pc_move, me, nullptr) : nullptr;
+}
+// called every tick with the local PlayerController (or null). Writes only on change, on a new movement
+// controller (respawn / new round) and as a slow re-assert, because the game's own param-apply can overwrite the flag.
+static void applyBhop(void *me, bool want) {
+    if (!mi_move_bhop) return;
+    if (g_bhopLastState < 0 && !want) return;           // never enabled: leave the game alone
+    void *mv = localMovement(me);
+    if (!mv) return;
+    bool due = g_bhopForce || mv != g_bhopLastMove || g_bhopLastState != (want ? 1 : 0) || (++g_bhopCount % 90) == 0;
+    if (!due) return;
+    bool v = want;
+    void *args[1] = { &v };
+    inv(mi_move_bhop, mv, args);
+    g_bhopLastMove = mv; g_bhopLastState = want ? 1 : 0; g_bhopForce = false;
+}
+
 static bool resolveAll() {
     void *core = findImage("UnityEngine.CoreModule.dll");
     void *game = findImage(kGameImage);
@@ -424,7 +477,8 @@ static bool resolveAll() {
     { void *kpc = il2_class_from_name(game, "Chillow.StandChillow.Player", "PlayerController");
       if (kpc) mi_hp = il2_get_method(kpc, "ode", 0);
       if (kpc) { mi_armor = il2_get_method(kpc, "odf", 0); mi_helm = il2_get_method(kpc, "odg", 0); }
-      NSLog(@"[SCESP] PlayerController.ode() = %p odf() = %p odg() = %p", mi_hp, mi_armor, mi_helm); }
+      NSLog(@"[SCESP] PlayerController.ode() = %p odf() = %p odg() = %p", mi_hp, mi_armor, mi_helm);
+      resolveBhop(game, kpc); }
     k_aim = il2_class_from_name(game, "Chillow.StandChillow.Player.Aim", "AimController");
     for (int r = 1; r < kHpRoots; r++) k_hpRoot[r] = il2_class_from_name(game, kHpRootDefs[r].ns, kHpRootDefs[r].name);
     if (il2_resolve_icall) {
@@ -994,6 +1048,8 @@ static std::unordered_map<void *, float> g_hpMax;
 // ---- floating damage numbers ----
 struct DmgPop { void *id; V3 pos; float amount; double t0; };
 struct DmgDraw { CGPoint p; float a, amt, k; };
+// value text inside a bar: x = bar centre, y = bar top; side<0 = hp bar, side>0 = armor bar
+struct BarTxt { CGFloat x, y; int v, side; float ratio; };
 static std::vector<DmgPop> g_pops;
 static std::unordered_map<void *, float> g_hpPrev;      // last HP seen per character; a drop = damage taken
 static void dmgSpawn(void *id, V3 pos, float amt, double now) {
@@ -1472,6 +1528,14 @@ static inline CGFloat nlMidY(CGRect r) { return r.origin.y + r.size.height * 0.5
 }
 @end
 
+// Scroll view for the panel pages: lets a drag that starts on a toggle/button scroll the page
+// (stock UIScrollView refuses to cancel touches inside UIControls, and the cards are full of them).
+@interface NLScroll : UIScrollView
+@end
+@implementation NLScroll
+- (BOOL)touchesShouldCancelInContentView:(UIView *)view { return YES; }
+@end
+
 struct NLCard { __unsafe_unretained UIView *v; CGFloat y, w; };
 static NLCard nlCard(UIView *parent, NSString *title, CGFloat x, CGFloat y, CGFloat w) {
     UIView *c = [[UIView alloc] initWithFrame:CGRectMake(x, y, w, 30)];
@@ -1606,6 +1670,7 @@ static SCNNode *buildAgentModel() {
     UIView *_overlay;
     CAShapeLayer *_boxes, *_skel;
     CAShapeLayer *_hpBack, *_hpG, *_hpY, *_hpR, *_hdot, *_arm, *_armFlag;
+    NSMutableArray *_barLabels;
     UIButton *_btn, *_hpBtn;
     UIView *_panel;
     UILabel *_status;
@@ -1707,8 +1772,9 @@ static SCNNode *buildAgentModel() {
         [tb addTarget:self action:@selector(tabTapped:) forControlEvents:UIControlEventTouchUpInside];
         [side addSubview:tb]; [_tabs addObject:tb];
 
-        UIScrollView *pg = [[UIScrollView alloc] initWithFrame:CGRectMake(PX, PY, PW, PH)];
-        pg.showsVerticalScrollIndicator = NO; pg.alwaysBounceVertical = NO; pg.delaysContentTouches = NO;
+        UIScrollView *pg = [[NLScroll alloc] initWithFrame:CGRectMake(PX, PY, PW, PH)];
+        pg.showsVerticalScrollIndicator = YES; pg.alwaysBounceVertical = YES; pg.delaysContentTouches = NO;
+        pg.canCancelContentTouches = YES; pg.indicatorStyle = UIScrollViewIndicatorStyleWhite;
         [_panel addSubview:pg]; [_pages addObject:pg];
     }
 
@@ -1819,7 +1885,10 @@ static SCNNode *buildAgentModel() {
         nlToggle(a, @"Low CPU", 6, g_set.lowcpu, self, @selector(swChanged:));
         nlToggle(a, @"No occlusion", 7, g_set.noocc, self, @selector(swChanged:));
         nlEnd(a);
-        NLCard st = nlCard(pg, @"Status", 0, nlMaxY(a.v.frame) + 8, PW);
+        NLCard mv = nlCard(pg, @"Movement", CW + 8, 0, CW);
+        nlToggle(mv, @"Bunny hop", 19, g_set.bhop, self, @selector(swChanged:));
+        nlEnd(mv);
+        NLCard st = nlCard(pg, @"Status", 0, fmax(nlMaxY(a.v.frame), nlMaxY(mv.v.frame)) + 8, PW);
         _status = nlInfo(st, 84, 8.5);
         _status.textColor = nlRGB(150, 165, 190);
         nlEnd(st);
@@ -1930,6 +1999,7 @@ static SCNNode *buildAgentModel() {
         case 16: g_set.dmg = s.on; if (!s.on) g_pops.clear(); break;
         case 17: g_set.dmgMine = s.on; break;
         case 18: g_set.armor = s.on; break;
+        case 19: g_set.bhop = s.on; g_bhopForce = true; break;
     }
     g_dirty = true; saveSettings();
 }
@@ -2034,6 +2104,7 @@ static SCNNode *buildAgentModel() {
     UIBezierPath *dotPath = [UIBezierPath bezierPath];
     UIBezierPath *fovPath = [UIBezierPath bezierPath];
     std::vector<DmgDraw> dd;
+    std::vector<BarTxt> bt;
     int drawn = 0, myTeam = -1;
     bool camOk = false;
     std::vector<void *> wantChams;
@@ -2073,6 +2144,7 @@ static SCNNode *buildAgentModel() {
 
                 std::vector<AimTg> tg; void *meObj = nullptr; int nBots = 0;
                 for (auto &p : ps) if (p.self) meObj = p.obj;
+                applyBhop(meObj, g_set.bhop);
                 std::vector<CGPoint> sp; std::vector<char> okp;
                 for (auto &p : ps) {
                     if (p.self) continue;
@@ -2204,26 +2276,24 @@ static SCNNode *buildAgentModel() {
                             if (mx < (mi_hp ? 100.f : g_hpRef)) mx = mi_hp ? 100.f : g_hpRef;
                             if (hv > mx) mx = hv;
                             CGFloat ratio = fminf(1.f, hv / mx);
-                            CGFloat bw = fmax(3.0, g_set.lw * 2), bx = r.origin.x - bw - 3;
+                            CGFloat bw = 15.0, bx = r.origin.x - bw - 3;     // wide enough for the number inside the bar
                             [hpBack appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(bx - 1, r.origin.y - 1, bw + 2, r.size.height + 2)]];
                             CGFloat fh = r.size.height * ratio;
                             UIBezierPath *tgt = ratio > 0.6 ? hpG : (ratio > 0.3 ? hpY : hpR);
                             [tgt appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(bx, r.origin.y + r.size.height - fh, bw, fh)]];
+                            bt.push_back({ bx + bw * 0.5, r.origin.y, (int)lroundf(hv), -1, (float)ratio });
                         }
-                        // armor bar: right side of the box, blue; the gold dot above it = odg() armor flag
+                        // armor bar: right side of the box, blue (the gold odg() flag dot was removed)
                         if (wantArmor && !(hpOk && hpv <= 0.f)) {
                             int av = 0; bool flag = false;
-                            if (readArmor(p.obj, av, flag) && (av > 0 || flag)) {
-                                CGFloat bw = fmax(3.0, g_set.lw * 2), ax = r.origin.x + r.size.width + 3;
+                            if (readArmor(p.obj, av, flag) && av > 0) {
+                                CGFloat bw = 15.0, ax = r.origin.x + r.size.width + 3;
                                 if (av > 0) {
                                     CGFloat ratio = fminf(1.f, (float)av / 100.f);
                                     [hpBack appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(ax - 1, r.origin.y - 1, bw + 2, r.size.height + 2)]];
                                     CGFloat fh = r.size.height * ratio;
                                     [armPath appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(ax, r.origin.y + r.size.height - fh, bw, fh)]];
-                                }
-                                if (flag) {
-                                    CGFloat d = bw + 4;
-                                    [armFlagPath appendPath:[UIBezierPath bezierPathWithOvalInRect:CGRectMake(ax - 2, r.origin.y - d - 3, d, d)]];
+                                    bt.push_back({ ax + bw * 0.5, r.origin.y, av, 1, (float)ratio });
                                 }
                             }
                         }
@@ -2365,6 +2435,27 @@ static SCNNode *buildAgentModel() {
         dl.textColor = dr.amt >= 60 ? nlRGB(255, 70, 70) : (dr.amt >= 30 ? nlRGB(255, 205, 70) : UIColor.whiteColor);
         [dl sizeToFit];
         dl.center = dr.p; dl.alpha = dr.a; dl.hidden = NO;
+    }
+    // hp / armor numbers next to the bars (hp left of its bar, armor right of its bar)
+    if (!_barLabels) _barLabels = [NSMutableArray array];
+    if (bt.size() > 80) bt.resize(80);
+    while (_barLabels.count < bt.size()) {
+        UILabel *bl = [[UILabel alloc] init];
+        bl.hidden = YES; bl.userInteractionEnabled = NO;
+        bl.font = [UIFont monospacedDigitSystemFontOfSize:8 weight:UIFontWeightHeavy];
+        bl.shadowColor = [UIColor colorWithWhite:0 alpha:0.95]; bl.shadowOffset = CGSizeMake(1, 1);
+        [_overlay addSubview:bl]; [_barLabels addObject:bl];
+    }
+    for (NSUInteger i = 0; i < _barLabels.count; i++) {
+        UILabel *bl = _barLabels[i];
+        if (i >= bt.size()) { bl.hidden = YES; continue; }
+        const BarTxt &t = bt[i];
+        bl.text = [NSString stringWithFormat:@"%d", t.v];
+        bl.textColor = UIColor.whiteColor;                        // white on the bar, black shadow keeps it readable on any fill
+        [bl sizeToFit];
+        CGRect f = bl.frame; f.origin.y = t.y + 1;               // inside the bar, at its top
+        f.origin.x = t.x - f.size.width * 0.5;                   // centred on the bar
+        bl.frame = f; bl.hidden = NO;
     }
     [CATransaction commit];
 
