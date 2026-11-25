@@ -52,7 +52,7 @@ static const char *kChamShaders[] = { "Hidden/Internal-Colored", "GUI/Text Shade
 static const char *kBoneSkip[] = { "root", "ik", "target", "pole", "weapon", "gun" };
 // bones further than this from the player pivot are junk (IK helpers, world-origin bones)
 static const float kBelowFeet = 0.3f, kMaxReach = 2.0f;
-static const CGFloat kBarW = 8.0;      // health / armor bar thickness in px (was 15)
+static const CGFloat kBarW = 5.0;      // health / armor bar thickness in px (was 15)
 static const float kAimFov = 18.0f;   // degrees: aim lock only grabs targets this close to the crosshair
 
 // ---- aim body-part selection ------------------------------------------------------------
@@ -2561,7 +2561,7 @@ static SCNNode *buildAgentModel() {
     while (_barLabels.count < bt.size()) {
         UILabel *bl = [[UILabel alloc] init];
         bl.hidden = YES; bl.userInteractionEnabled = NO;
-        bl.font = [UIFont monospacedDigitSystemFontOfSize:6.5 weight:UIFontWeightHeavy];
+        bl.font = [UIFont monospacedDigitSystemFontOfSize:8 weight:UIFontWeightHeavy];
         bl.shadowColor = [UIColor colorWithWhite:0 alpha:0.95]; bl.shadowOffset = CGSizeMake(1, 1);
         [_overlay addSubview:bl]; [_barLabels addObject:bl];
     }
@@ -2572,8 +2572,9 @@ static SCNNode *buildAgentModel() {
         bl.text = [NSString stringWithFormat:@"%d", t.v];
         bl.textColor = UIColor.whiteColor;                        // white on the bar, black shadow keeps it readable on any fill
         [bl sizeToFit];
-        CGRect f = bl.frame; f.origin.y = t.y + 1;               // inside the bar, at its top
-        f.origin.x = t.x - f.size.width * 0.5;                   // centred on the bar
+        CGRect f = bl.frame; f.origin.y = t.y;                   // aligned with the top of the bar
+        f.origin.x = (t.side < 0) ? (t.x - kBarW * 0.5 - 2 - f.size.width)   // hp: left of its bar, right-aligned to it
+                                  : (t.x + kBarW * 0.5 + 2);                 // armor: right of its bar
         bl.frame = f; bl.hidden = NO;
     }
     [CATransaction commit];
