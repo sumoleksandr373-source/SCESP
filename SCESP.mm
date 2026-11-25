@@ -1,4 +1,4 @@
-// SCESP.mm v5.7 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
+// SCESP.mm v5.8 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
 //
 // Box / skeleton / chams / box fill / health bar, enemies only (teammates optional), settings panel.
 // Tap the small "ESP" plate (top-left) to open/close the settings panel.
@@ -2584,8 +2584,8 @@ static SCNNode *buildAgentModel() {
         NSMutableString *cs = [NSMutableString string];
         for (int i = 0; i < kN; i++) [cs appendFormat:@"%s%zu", i ? "/" : "", g_counts[i]];
         NSString *sh = g_chamShaderUsed ? [NSString stringWithUTF8String:g_chamShaderUsed] : (g_chamFailed ? @"no shader" : @"-");
-        _status.text = [NSString stringWithFormat:@"found %@ | team f%d me%d | draw %d | cam %@\nchams %@ %s %zu re%d | occ %s",
-                        cs, g_teamField, myTeam, drawn, camOk ? @"ok" : @"-", [sh lastPathComponent],
+        _status.text = [NSString stringWithFormat:@"v5.8 bars %.0fpx | found %@ | team f%d me%d | draw %d | cam %@\nchams %@ %s %zu re%d | occ %s",
+                        (double)kBarW, cs, g_teamField, myTeam, drawn, camOk ? @"ok" : @"-", [sh lastPathComponent],
                         g_chamMode == 2 ? "noX" : "xray", g_chams.size(), g_chamReapply,
                         g_occOff ? "off" : "on"];
         @try {
