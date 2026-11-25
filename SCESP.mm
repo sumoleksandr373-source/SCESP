@@ -1,4 +1,4 @@
-// SCESP.mm v5.6 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
+// SCESP.mm v5.7 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
 //
 // Box / skeleton / chams / box fill / health bar, enemies only (teammates optional), settings panel.
 // Tap the small "ESP" plate (top-left) to open/close the settings panel.
@@ -15,6 +15,9 @@
 //   odg() armor flag (v24 reverse notes: HUD reads ode/odf/odg together). Meaning of odg() is by data flow, not proven.
 // - bunny hop (v5.6): flips the game's own PlayerCheatParameters._bhop path on the local player via
 //   MovementController.ouk(bool) (state +0x6F; physics branch uses BhopSpeedStep/ResetTime/MaxSpeed). Offline bot matches only.
+//   v5.7: full bhop settings (Misc > Movement): "Custom values" + Speed step / Max speed / Reset time sliders. The three floats are
+//   found at runtime by field name (no hardcoded offsets); sliders are multipliers of the game's own value, so units never matter.
+//   Untick Custom values (or Bunny hop) and the game's original values are written back.
 // - hot path uses direct method-pointer calls; drawing is 30 fps, scan about once a second
 //
 // Not compiled or run on a device by me. If something misbehaves, the panel's status line says where.
@@ -75,6 +78,8 @@ static NSString *aimPartTitle(int part) {
 struct Settings {
     bool on = true, box = true, skel = true, chams = false, fill = false, team = false, lowcpu = false, noocc = true, aim = false, hp = true, hdot = true;
     bool bhop = false;      // enable the game's built-in bunny-hop movement flag on the local player
+    bool bhopCustom = false;                                  // apply the multipliers below to the game's bhop parameters
+    float bhopStep = 1.0f, bhopMax = 1.0f, bhopReset = 1.0f;  // multipliers: speed step / max speed / reset time
     int color = 0;
     float lw = 1.5f;
     float head = 1.8f;
@@ -109,6 +114,8 @@ static void saveSettings() {
     [d setBool:g_set.hp forKey:@"scesp_hp"];
     [d setBool:g_set.hdot forKey:@"scesp_hdot"];
     [d setBool:g_set.bhop forKey:@"scesp_bhop"];
+    [d setBool:g_set.bhopCustom forKey:@"scesp_bhcus"];
+    [d setFloat:g_set.bhopStep forKey:@"scesp_bhstep"]; [d setFloat:g_set.bhopMax forKey:@"scesp_bhmax"]; [d setFloat:g_set.bhopReset forKey:@"scesp_bhrst"];
     [d setInteger:g_set.color forKey:@"scesp_color"];
     [d setFloat:g_set.lw forKey:@"scesp_lw"];      [d setFloat:g_set.head forKey:@"scesp_head"];
     [d setFloat:g_set.fov forKey:@"scesp_fov"];
@@ -129,6 +136,10 @@ static void loadSettings() {
     g_set.noocc = [d objectForKey:@"scesp_noocc"] ? [d boolForKey:@"scesp_noocc"] : true;
     g_set.hdot = [d objectForKey:@"scesp_hdot"] ? [d boolForKey:@"scesp_hdot"] : true;
     g_set.bhop = [d boolForKey:@"scesp_bhop"];
+    g_set.bhopCustom = [d boolForKey:@"scesp_bhcus"];
+    g_set.bhopStep = [d floatForKey:@"scesp_bhstep"];   if (g_set.bhopStep  < 0.1f) g_set.bhopStep  = 1.0f;
+    g_set.bhopMax = [d floatForKey:@"scesp_bhmax"];     if (g_set.bhopMax   < 0.1f) g_set.bhopMax   = 1.0f;
+    g_set.bhopReset = [d floatForKey:@"scesp_bhrst"];   if (g_set.bhopReset < 0.1f) g_set.bhopReset = 1.0f;
     g_set.hp = [d objectForKey:@"scesp_hp"] ? [d boolForKey:@"scesp_hp"] : true;
     g_set.color = (int)[d integerForKey:@"scesp_color"];
     g_set.lw = [d floatForKey:@"scesp_lw"];        g_set.head = [d floatForKey:@"scesp_head"];
@@ -360,8 +371,10 @@ static void *g_bhopLastMove = nullptr;
 static int   g_bhopLastState = -1;  // -1 = never touched, 0/1 = last value we wrote
 static int   g_bhopCount = 0;
 static bool  g_bhopForce = false;
+static void *k_pcls;                // PlayerController class (params may hang off the player, not only the movement controller)
 
 static void resolveBhop(void *game, void *kpc) {
+    k_pcls = kpc;
     k_move = il2_class_from_name(game, "Chillow.StandChillow.Player.Movement", "MovementController");
     if (k_move) mi_move_bhop = findMethod(k_move, "ouk", 1, "System.Boolean");
     if (kpc) {
@@ -380,19 +393,114 @@ static void *localMovement(void *me) {
     if (g_moveOff > 0) return *(void **)((char *)me + g_moveOff);
     return mi_pc_move ? inv(mi_pc_move, me, nullptr) : nullptr;
 }
-// called every tick with the local PlayerController (or null). Writes only on change, on a new movement
-// controller (respawn / new round) and as a slow re-assert, because the game's own param-apply can overwrite the flag.
+// ---- bunny hop parameters ----------------------------------------------------------------
+// The game's bhop physics branch reads three floats: speed step, max speed, reset time. They are found at runtime by FIELD NAME on the
+// MovementController and PlayerController object graphs (2 levels deep, inline structs included), so no offsets are hardcoded.
+// A float counts when its name contains "bhop", or when its owner class name contains "cheat"/"bhop"; then "step" / "max" / "reset" picks the slot.
+// Sliders are multipliers of the value the game had when the field was first seen, so the units never matter.
+// If nothing is found the panel says so and every candidate float is printed to the log ("[SCESP] bhop field ...").
+struct BhopSlot { float *p; float base; bool have; int prio; };
+static BhopSlot g_bhSlot[3];                       // 0 speed step, 1 max speed, 2 reset time
+static NSString *g_bhopMsg = @"bhop: -";
+static bool g_bhopWrote = false, g_bhopParamsDirty = true;
+static int  g_bhopLog = 0, g_bhopObscured = 0;
+
+static std::string lowerOf(const char *s) { std::string o; for (; s && *s; s++) o += (char)tolower((unsigned char)*s); return o; }
+static bool hasSub(const std::string &h, const char *n) { return h.find(n) != std::string::npos; }
+static bool plausibleObj(void *p) { uintptr_t u = (uintptr_t)p; return u > 0x100000000ULL && (u & 7) == 0; }
+
+static void bhopWalk(void *klass, char *obj, int adj, int depth, std::vector<void *> &seen) {
+    typedef const char *(*f_nm)(void *);
+    static f_nm cName = (f_nm)dlsym(RTLD_DEFAULT, "il2cpp_class_get_name");
+    if (!klass || !obj || !il2_field_name) return;
+    for (void *k = klass; k; k = il2_class_parent(k)) {
+        std::string cn = lowerOf(cName ? cName(k) : "");
+        bool ownerOk = hasSub(cn, "cheat") || hasSub(cn, "bhop");
+        void *iter = nullptr, *f;
+        while ((f = il2_class_fields(k, &iter))) {
+            if (il2_field_flags(f) & 0x10) continue;                       // static
+            void *ft = il2_field_type(f);
+            const char *tn = ft ? il2_type_name(ft) : nullptr;
+            const char *fnp = il2_field_name(f);
+            if (!tn || !fnp) continue;
+            int off = adj + il2_field_offset(f);
+            if (!strcmp(tn, "System.Single")) {
+                std::string fn = lowerOf(fnp);
+                bool named = hasSub(fn, "bhop");
+                if (!named && !ownerOk) continue;
+                float *fp = (float *)(obj + off);
+                if (g_bhopLog < 40) { g_bhopLog++; NSLog(@"[SCESP] bhop field %s.%s = %f (off 0x%x)", cName ? cName(k) : "?", fnp, *fp, off); }
+                int slot = hasSub(fn, "step") ? 0 : hasSub(fn, "max") ? 1 : hasSub(fn, "reset") ? 2 : -1;
+                if (slot < 0) continue;
+                float v = *fp;
+                if (v != v || fabsf(v) > 1e6f) continue;                   // NaN / junk
+                int prio = named ? 2 : 1;
+                if (g_bhSlot[slot].p && g_bhSlot[slot].prio >= prio) continue;
+                g_bhSlot[slot].p = fp; g_bhSlot[slot].prio = prio;
+                if (!g_bhSlot[slot].have) { g_bhSlot[slot].base = v; g_bhSlot[slot].have = true; }
+            } else if (strstr(tn, "ObscuredFloat")) {
+                std::string fn = lowerOf(fnp);
+                if (hasSub(fn, "bhop") || ownerOk) g_bhopObscured++;       // ACTk-wrapped: not a plain float, left alone
+            } else if (il2_class_from_type && il2_class_is_vt && !strncmp(tn, "Chillow.StandChillow.", 21)) {
+                void *nk = il2_class_from_type(ft);
+                if (!nk) continue;
+                if (il2_class_is_vt(nk)) { if (depth < 3) bhopWalk(nk, obj, off - 16, depth + 1, seen); }
+                else if (depth < 2) {
+                    void *ptr = *(void **)(obj + off);
+                    if (!plausibleObj(ptr) || std::find(seen.begin(), seen.end(), ptr) != seen.end()) continue;
+                    seen.push_back(ptr);
+                    bhopWalk(nk, (char *)ptr, 0, depth + 1, seen);
+                }
+            }
+        }
+    }
+}
+static void bhopDiscover(void *mv, void *me) {
+    for (auto &sl : g_bhSlot) { sl.p = nullptr; sl.prio = 0; }
+    std::vector<void *> seen;
+    if (k_move && mv) { seen.push_back(mv); bhopWalk(k_move, (char *)mv, 0, 0, seen); }
+    if (k_pcls && me) { seen.push_back(me); bhopWalk(k_pcls, (char *)me, 0, 0, seen); }
+    static const char *nm[3] = { "step", "max", "reset" };
+    NSMutableString *m = [NSMutableString stringWithString:@"bhop (game values):"];
+    int n = 0;
+    for (int i = 0; i < 3; i++) {
+        if (g_bhSlot[i].p && g_bhSlot[i].have) { n++; [m appendFormat:@" %s %.3g", nm[i], g_bhSlot[i].base]; }
+        else [m appendFormat:@" %s -", nm[i]];
+    }
+    if (!n) [m appendString:g_bhopObscured ? @"\n(fields are obscured, not writable)" : @"\nnot found, see log"];
+    g_bhopMsg = m;
+}
+static void bhopWriteParams(bool active) {
+    const float mult[3] = { g_set.bhopStep, g_set.bhopMax, g_set.bhopReset };
+    for (int i = 0; i < 3; i++) {
+        BhopSlot &sl = g_bhSlot[i];
+        if (!sl.p || !sl.have) continue;
+        float v = active ? sl.base * mult[i] : sl.base;                    // inactive = put the game's own value back
+        if (*sl.p != v) *sl.p = v;
+    }
+    g_bhopWrote = active;
+}
+
+// called every tick with the local PlayerController (or null). Writes the flag only on change, on a new movement
+// controller (respawn / new round) and as a slow re-assert, because the game's own param-apply can overwrite it.
+// The parameter floats are re-located about once a second (and on every new controller) and re-asserted every tick while Custom values is on.
 static void applyBhop(void *me, bool want) {
     if (!mi_move_bhop) return;
     if (g_bhopLastState < 0 && !want) return;           // never enabled: leave the game alone
     void *mv = localMovement(me);
     if (!mv) return;
-    bool due = g_bhopForce || mv != g_bhopLastMove || g_bhopLastState != (want ? 1 : 0) || (++g_bhopCount % 90) == 0;
-    if (!due) return;
-    bool v = want;
-    void *args[1] = { &v };
-    inv(mi_move_bhop, mv, args);
-    g_bhopLastMove = mv; g_bhopLastState = want ? 1 : 0; g_bhopForce = false;
+    bool newMv = mv != g_bhopLastMove;
+    bool due = g_bhopForce || newMv || g_bhopLastState != (want ? 1 : 0) || (++g_bhopCount % 90) == 0;
+    if (due) {
+        bool v = want;
+        void *args[1] = { &v };
+        inv(mi_move_bhop, mv, args);
+        g_bhopLastMove = mv; g_bhopLastState = want ? 1 : 0; g_bhopForce = false;
+    }
+    static int pc = 0;
+    if (newMv || g_bhopParamsDirty || (++pc % 30) == 0) { bhopDiscover(mv, me); g_bhopParamsDirty = false; }
+    bool custom = want && g_set.bhopCustom;
+    if (custom || g_bhopWrote) bhopWriteParams(custom);
 }
 
 static bool resolveAll() {
@@ -1675,6 +1783,7 @@ static SCNNode *buildAgentModel() {
     UIView *_panel;
     UILabel *_status;
     UILabel *_lwLabel, *_hdLabel, *_fovLabel, *_spdLabel, *_aimInfo, *_tabTitle;
+    UILabel *_bhStepLabel, *_bhMaxLabel, *_bhRstLabel, *_bhopInfo;
     CAShapeLayer *_fovRing;
     NSMutableArray *_pages, *_tabs, *_swatches, *_dmgLabels;
     NSMutableArray *_aimPartButtons, *_aimChipButtons;
@@ -1887,6 +1996,11 @@ static SCNNode *buildAgentModel() {
         nlEnd(a);
         NLCard mv = nlCard(pg, @"Movement", CW + 8, 0, CW);
         nlToggle(mv, @"Bunny hop", 19, g_set.bhop, self, @selector(swChanged:));
+        nlToggle(mv, @"Custom values", 20, g_set.bhopCustom, self, @selector(swChanged:));
+        _bhStepLabel = nlSlider(mv, @"Speed step", 21, 0.25, 4, g_set.bhopStep, self, @selector(slChanged:));
+        _bhMaxLabel  = nlSlider(mv, @"Max speed", 22, 0.25, 4, g_set.bhopMax, self, @selector(slChanged:));
+        _bhRstLabel  = nlSlider(mv, @"Reset time", 23, 0.1, 4, g_set.bhopReset, self, @selector(slChanged:));
+        _bhopInfo = nlInfo(mv, 34, 8);
         nlEnd(mv);
         NLCard st = nlCard(pg, @"Status", 0, fmax(nlMaxY(a.v.frame), nlMaxY(mv.v.frame)) + 8, PW);
         _status = nlInfo(st, 84, 8.5);
@@ -1980,6 +2094,9 @@ static SCNNode *buildAgentModel() {
     _hdLabel.text = [NSString stringWithFormat:@"%.2f m", g_set.head];
     _fovLabel.text = [NSString stringWithFormat:@"%.0f\u00B0", g_set.fov];
     _spdLabel.text = [NSString stringWithFormat:@"%.0f", g_set.aimSpeed];
+    _bhStepLabel.text = [NSString stringWithFormat:@"x%.2f", g_set.bhopStep];
+    _bhMaxLabel.text  = [NSString stringWithFormat:@"x%.2f", g_set.bhopMax];
+    _bhRstLabel.text  = [NSString stringWithFormat:@"x%.2f", g_set.bhopReset];
 }
 
 - (void)swChanged:(NLToggle *)s {
@@ -1999,13 +2116,14 @@ static SCNNode *buildAgentModel() {
         case 16: g_set.dmg = s.on; if (!s.on) g_pops.clear(); break;
         case 17: g_set.dmgMine = s.on; break;
         case 18: g_set.armor = s.on; break;
-        case 19: g_set.bhop = s.on; g_bhopForce = true; break;
+        case 19: g_set.bhop = s.on; g_bhopForce = true; g_bhopParamsDirty = true; break;
+        case 20: g_set.bhopCustom = s.on; g_bhopParamsDirty = true; break;
     }
     g_dirty = true; saveSettings();
 }
 - (void)segChanged:(UISegmentedControl *)s { g_set.color = (int)s.selectedSegmentIndex; g_dirty = true; saveSettings(); }
 - (void)slChanged:(UISlider *)s {
-    if (s.tag == 10) g_set.lw = s.value; else if (s.tag == 13) g_set.fov = s.value; else if (s.tag == 14) g_set.aimSpeed = s.value; else g_set.head = s.value;
+    if (s.tag == 10) g_set.lw = s.value; else if (s.tag == 13) g_set.fov = s.value; else if (s.tag == 14) g_set.aimSpeed = s.value; else if (s.tag == 21) g_set.bhopStep = s.value; else if (s.tag == 22) g_set.bhopMax = s.value; else if (s.tag == 23) g_set.bhopReset = s.value; else g_set.head = s.value;
     [self refreshLabels]; saveSettings();
 }
 - (void)plateTapped { _panel.hidden = !_panel.hidden; }
@@ -2460,6 +2578,7 @@ static SCNNode *buildAgentModel() {
     [CATransaction commit];
 
     if (!_panel.hidden) {
+        _bhopInfo.text = g_bhopMsg;
         NSMutableString *cs = [NSMutableString string];
         for (int i = 0; i < kN; i++) [cs appendFormat:@"%s%zu", i ? "/" : "", g_counts[i]];
         NSString *sh = g_chamShaderUsed ? [NSString stringWithUTF8String:g_chamShaderUsed] : (g_chamFailed ? @"no shader" : @"-");
