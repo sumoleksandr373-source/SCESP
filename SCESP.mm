@@ -52,6 +52,7 @@ static const char *kChamShaders[] = { "Hidden/Internal-Colored", "GUI/Text Shade
 static const char *kBoneSkip[] = { "root", "ik", "target", "pole", "weapon", "gun" };
 // bones further than this from the player pivot are junk (IK helpers, world-origin bones)
 static const float kBelowFeet = 0.3f, kMaxReach = 2.0f;
+static const CGFloat kBarW = 2.0;      // health / armor bar thickness in px
 static const float kAimFov = 18.0f;   // degrees: aim lock only grabs targets this close to the crosshair
 
 // ---- aim body-part selection ------------------------------------------------------------
@@ -89,6 +90,7 @@ struct Settings {
     bool dmg = true;        // floating damage numbers
     bool dmgMine = true;    // damage numbers only for hits taken while the target is under my crosshair
     bool armor = true;      // armor bar (right of the box) + armor-flag marker, from PlayerController.odf()/odg()
+    bool wep = true;        // weapon name under the box (PlayerController -> Weaponry -> WeaponController -> WeaponParameters._shortName)
 };
 static Settings g_set;
 static bool g_dirty = true;
@@ -124,6 +126,7 @@ static void saveSettings() {
     [d setBool:g_set.dmg forKey:@"scesp_dmgnum"];
     [d setBool:g_set.dmgMine forKey:@"scesp_dmgmine"];
     [d setBool:g_set.armor forKey:@"scesp_armor"];
+    [d setBool:g_set.wep forKey:@"scesp_wep"];
     [d setInteger:g_selectedAimPart forKey:@"scesp_aim_part"];
 }
 static void loadSettings() {
@@ -151,6 +154,7 @@ static void loadSettings() {
     g_set.dmg = [d objectForKey:@"scesp_dmgnum"] ? [d boolForKey:@"scesp_dmgnum"] : true;
     g_set.dmgMine = [d objectForKey:@"scesp_dmgmine"] ? [d boolForKey:@"scesp_dmgmine"] : true;
     g_set.armor = [d objectForKey:@"scesp_armor"] ? [d boolForKey:@"scesp_armor"] : true;
+    g_set.wep = [d objectForKey:@"scesp_wep"] ? [d boolForKey:@"scesp_wep"] : true;
     g_selectedAimPart = (int)[d integerForKey:@"scesp_aim_part"];
     if (g_selectedAimPart < 0 || g_selectedAimPart >= kAimPartCount) g_selectedAimPart = kAimHead;
 }
@@ -1157,7 +1161,8 @@ static std::unordered_map<void *, float> g_hpMax;
 struct DmgPop { void *id; V3 pos; float amount; double t0; };
 struct DmgDraw { CGPoint p; float a, amt, k; };
 // value text inside a bar: x = bar centre, y = bar top; side<0 = hp bar, side>0 = armor bar
-struct BarTxt { CGFloat x, y; int v, side; float ratio; };
+struct BarTxt { CGFloat x, y; int v, side; float ratio; CGFloat h; };
+struct WepTxt { CGFloat x, y; char s[24]; };                 // weapon name under the box: x = box centre, y = box bottom
 static std::vector<DmgPop> g_pops;
 static std::unordered_map<void *, float> g_hpPrev;      // last HP seen per character; a drop = damage taken
 static void dmgSpawn(void *id, V3 pos, float amt, double now) {
@@ -1186,6 +1191,30 @@ static bool readArmor(void *obj, int &armor, bool &flag) {
     armor = v;
     if (mi_helm) { void *h = inv(mi_helm, obj, nullptr); if (h) flag = *(bool *)((char *)h + 16); }
     return true;
+}
+// Weapon in the character's hands, from the static dump (StandChillow 2.07):
+//   PlayerController +0xD8 WeaponryController -> +0x98 WeaponController -> +0xA8 WeaponParameters -> +0x28 _shortName (string)
+// Every hop is range-checked before it is dereferenced; any miss just means "no label".
+static const int kOffWeaponry = 0xD8, kOffWepCur = 0x98, kOffWepPar = 0xA8, kOffWepShort = 0x28;
+static inline bool okPtr(void *p) { uintptr_t v = (uintptr_t)p; return v > 0x100000000ULL && v < 0x800000000000ULL && (v & 7) == 0; }
+static bool readWeaponName(void *obj, char *out, size_t cap) {
+    out[0] = 0;
+    if (!okPtr(obj)) return false;
+    void *wy = *(void **)((char *)obj + kOffWeaponry);   if (!okPtr(wy)) return false;
+    void *wc = *(void **)((char *)wy + kOffWepCur);      if (!okPtr(wc)) return false;
+    void *wp = *(void **)((char *)wc + kOffWepPar);      if (!okPtr(wp)) return false;
+    void *st = *(void **)((char *)wp + kOffWepShort);    if (!okPtr(st)) return false;
+    int len = *(int *)((char *)st + 0x10);               // il2cpp string: length @+0x10, UTF-16 chars @+0x14
+    if (len <= 0 || len > 32) return false;
+    const uint16_t *ch = (const uint16_t *)((char *)st + 0x14);
+    size_t n = 0;
+    for (int i = 0; i < len && n + 1 < cap; i++) {
+        uint16_t c = ch[i];
+        if (c < 0x20 || c > 0x7E) return (out[n] = 0, false);   // not plain text -> wrong object, show nothing
+        out[n++] = (char)c;
+    }
+    out[n] = 0;
+    return n > 0;
 }
 static NSString *hpName(const HCand &c) {
     static const char *kn[] = { "float", "int", "obsF", "obsI" };
@@ -1779,6 +1808,7 @@ static SCNNode *buildAgentModel() {
     CAShapeLayer *_boxes, *_skel;
     CAShapeLayer *_hpBack, *_hpG, *_hpY, *_hpR, *_hdot, *_arm, *_armFlag;
     NSMutableArray *_barLabels;
+    NSMutableArray *_wepLabels;
     UIButton *_btn, *_hpBtn;
     UIView *_panel;
     UILabel *_status;
@@ -1973,6 +2003,7 @@ static SCNNode *buildAgentModel() {
         nlToggle(a, @"Head dot", 12, g_set.hdot, self, @selector(swChanged:));
         nlToggle(a, @"Health bar", 9, g_set.hp, self, @selector(swChanged:));
         nlToggle(a, @"Armor bar", 18, g_set.armor, self, @selector(swChanged:));
+        nlToggle(a, @"Weapon name", 24, g_set.wep, self, @selector(swChanged:));
         nlToggle(a, @"Damage numbers", 16, g_set.dmg, self, @selector(swChanged:));
         nlToggle(a, @"My damage only", 17, g_set.dmgMine, self, @selector(swChanged:));
         nlToggle(a, @"Teammates", 5, g_set.team, self, @selector(swChanged:));
@@ -2116,6 +2147,7 @@ static SCNNode *buildAgentModel() {
         case 16: g_set.dmg = s.on; if (!s.on) g_pops.clear(); break;
         case 17: g_set.dmgMine = s.on; break;
         case 18: g_set.armor = s.on; break;
+        case 24: g_set.wep = s.on; break;
         case 19: g_set.bhop = s.on; g_bhopForce = true; g_bhopParamsDirty = true; break;
         case 20: g_set.bhopCustom = s.on; g_bhopParamsDirty = true; break;
     }
@@ -2218,11 +2250,13 @@ static SCNNode *buildAgentModel() {
     UIBezierPath *hpBack = [UIBezierPath bezierPath], *hpG = [UIBezierPath bezierPath], *hpY = [UIBezierPath bezierPath], *hpR = [UIBezierPath bezierPath];
     bool wantHp = g_set.hp && (mi_hp || g_haveHp);
     bool wantArmor = g_set.armor && mi_armor;
+    bool wantWep = g_set.wep;
     UIBezierPath *armPath = [UIBezierPath bezierPath], *armFlagPath = [UIBezierPath bezierPath];
     UIBezierPath *dotPath = [UIBezierPath bezierPath];
     UIBezierPath *fovPath = [UIBezierPath bezierPath];
     std::vector<DmgDraw> dd;
     std::vector<BarTxt> bt;
+    std::vector<WepTxt> wt;
     int drawn = 0, myTeam = -1;
     bool camOk = false;
     std::vector<void *> wantChams;
@@ -2371,7 +2405,7 @@ static SCNNode *buildAgentModel() {
                             [skelPath moveToPoint:sp[par]]; [skelPath addLineToPoint:sp[b]];
                         }
                     }
-                    if (g_set.box || g_set.fill || wantHp || wantArmor) {
+                    if (g_set.box || g_set.fill || wantHp || wantArmor || wantWep) {
                         CGRect r;
                         if (haveBones) {
                             CGFloat pad = 6;
@@ -2394,26 +2428,30 @@ static SCNNode *buildAgentModel() {
                             if (mx < (mi_hp ? 100.f : g_hpRef)) mx = mi_hp ? 100.f : g_hpRef;
                             if (hv > mx) mx = hv;
                             CGFloat ratio = fminf(1.f, hv / mx);
-                            CGFloat bw = 2.0, bx = r.origin.x - bw - 3;     // wide enough for the number inside the bar
+                            CGFloat bw = kBarW, bx = r.origin.x - bw - 3;     // wide enough for the number inside the bar
                             [hpBack appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(bx - 1, r.origin.y - 1, bw + 2, r.size.height + 2)]];
                             CGFloat fh = r.size.height * ratio;
                             UIBezierPath *tgt = ratio > 0.6 ? hpG : (ratio > 0.3 ? hpY : hpR);
                             [tgt appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(bx, r.origin.y + r.size.height - fh, bw, fh)]];
-                            bt.push_back({ bx + bw * 0.5, r.origin.y, (int)lroundf(hv), -1, (float)ratio });
+                            bt.push_back({ bx + bw * 0.5, r.origin.y, (int)lroundf(hv), -1, (float)ratio, r.size.height });
                         }
                         // armor bar: right side of the box, blue (the gold odg() flag dot was removed)
                         if (wantArmor && !(hpOk && hpv <= 0.f)) {
                             int av = 0; bool flag = false;
                             if (readArmor(p.obj, av, flag) && av > 0) {
-                                CGFloat bw = 2.0, ax = r.origin.x + r.size.width + 3;
+                                CGFloat bw = kBarW, ax = r.origin.x + r.size.width + 3;
                                 if (av > 0) {
                                     CGFloat ratio = fminf(1.f, (float)av / 100.f);
                                     [hpBack appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(ax - 1, r.origin.y - 1, bw + 2, r.size.height + 2)]];
                                     CGFloat fh = r.size.height * ratio;
                                     [armPath appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(ax, r.origin.y + r.size.height - fh, bw, fh)]];
-                                    bt.push_back({ ax + bw * 0.5, r.origin.y, av, 1, (float)ratio });
+                                    bt.push_back({ ax + bw * 0.5, r.origin.y, av, 1, (float)ratio, r.size.height });
                                 }
                             }
+                        }
+                        if (wantWep && !(hpOk && hpv <= 0.f)) {
+                            WepTxt w; w.x = r.origin.x + r.size.width * 0.5; w.y = r.origin.y + r.size.height + 2;
+                            if (readWeaponName(p.obj, w.s, sizeof(w.s))) wt.push_back(w);
                         }
                     }
                     drawn++;
@@ -2568,12 +2606,43 @@ static SCNNode *buildAgentModel() {
         UILabel *bl = _barLabels[i];
         if (i >= bt.size()) { bl.hidden = YES; continue; }
         const BarTxt &t = bt[i];
-        bl.text = [NSString stringWithFormat:@"%d", t.v];
-        bl.textColor = UIColor.whiteColor;                        // white on the bar, black shadow keeps it readable on any fill
-        [bl sizeToFit];
-        CGRect f = bl.frame; f.origin.y = t.y + 1;               // inside the bar, at its top
-        f.origin.x = t.x - f.size.width * 0.5;                   // centred on the bar
-        bl.frame = f; bl.hidden = NO;
+        // digits stacked top-to-bottom inside the bar: 100 -> 1 / 0 / 0
+        NSString *num = [NSString stringWithFormat:@"%d", t.v];
+        int nd = (int)num.length;
+        float fs = fminf((float)(kBarW * 1.75), fmaxf(2.5f, (float)(t.h - 2.0) / (float)nd));   // follows bar width, shrinks on far bars
+        NSMutableString *stk = [NSMutableString string];
+        for (int c = 0; c < nd; c++) {
+            if (c) [stk appendString:@"\n"];
+            [stk appendString:[num substringWithRange:NSMakeRange(c, 1)]];
+        }
+        bl.numberOfLines = 0;
+        bl.textAlignment = NSTextAlignmentCenter;
+        bl.font = [UIFont monospacedDigitSystemFontOfSize:fs weight:UIFontWeightHeavy];
+        bl.textColor = UIColor.whiteColor;
+        bl.text = stk;
+        CGFloat bwid = kBarW + 4;
+        CGFloat lh = bl.font.lineHeight;
+        bl.frame = CGRectMake(t.x - bwid * 0.5, t.y + 1, bwid, lh * nd);
+        bl.hidden = NO;
+    }
+    // weapon names under the boxes
+    if (!_wepLabels) _wepLabels = [NSMutableArray array];
+    if (wt.size() > 40) wt.resize(40);
+    while (_wepLabels.count < wt.size()) {
+        UILabel *wl = [[UILabel alloc] init];
+        wl.hidden = YES; wl.userInteractionEnabled = NO;
+        wl.font = [UIFont systemFontOfSize:9 weight:UIFontWeightHeavy];
+        wl.textColor = UIColor.whiteColor; wl.textAlignment = NSTextAlignmentCenter;
+        wl.shadowColor = [UIColor colorWithWhite:0 alpha:0.95]; wl.shadowOffset = CGSizeMake(1, 1);
+        [_overlay addSubview:wl]; [_wepLabels addObject:wl];
+    }
+    for (NSUInteger i = 0; i < _wepLabels.count; i++) {
+        UILabel *wl = _wepLabels[i];
+        if (i >= wt.size()) { wl.hidden = YES; continue; }
+        wl.text = [NSString stringWithUTF8String:wt[i].s];
+        [wl sizeToFit];
+        wl.center = CGPointMake(wt[i].x, wt[i].y + wl.bounds.size.height * 0.5);
+        wl.hidden = NO;
     }
     [CATransaction commit];
 
