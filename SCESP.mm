@@ -1786,7 +1786,7 @@ static inline CGFloat nlMidY(CGRect r) { return r.origin.y + r.size.height * 0.5
 static CALayer *nlKnob() {
     CALayer *k = [CALayer layer];
     k.bounds = CGRectMake(0, 0, 15, 15); k.cornerRadius = 7.5; k.borderWidth = 2; k.borderColor = UIColor.whiteColor.CGColor;
-    k.shadowColor = UIColor.blackColor.CGColor; k.shadowOpacity = 0.6; k.shadowRadius = 2; k.shadowOffset = CGSizeZero;
+    k.shadowColor = UIColor.blackColor.CGColor; k.shadowOpacity = 0.6; k.shadowRadius = 2; k.shadowOffset = CGSizeMake(0, 0);
     return k;
 }
 - (instancetype)initWithFrame:(CGRect)f {
@@ -2364,14 +2364,17 @@ static BOOL g_panelClosing = NO;
 // menu open / close: fade + small scale + slide; opening has a light spring, closing is a quick ease-in
 - (void)setPanelOpen:(BOOL)open {
     UIView *pn = _panel;
-    CGAffineTransform away = CGAffineTransformConcat(CGAffineTransformMakeScale(open ? 0.92 : 0.95, open ? 0.92 : 0.95), CGAffineTransformMakeTranslation(0, -10));
+    // plain struct literals: this build does not link CoreGraphics, so no CGAffineTransform* function calls
+    CGFloat sc = open ? 0.92 : 0.95;
+    CGAffineTransform away  = (CGAffineTransform){ sc, 0, 0, sc, 0, -10 };     // scale, then move up 10pt
+    CGAffineTransform ident = (CGAffineTransform){ 1, 0, 0, 1, 0, 0 };
     if (open) {
         g_panelClosing = NO;
         if (pn.hidden) { pn.alpha = 0; pn.transform = away; pn.hidden = NO; }
         else if (pn.alpha > 0.99) return;
         [UIView animateWithDuration:0.28 delay:0 usingSpringWithDamping:0.82 initialSpringVelocity:0.4
                             options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
-                         animations:^{ pn.alpha = 1; pn.transform = CGAffineTransformIdentity; } completion:nil];
+                         animations:^{ pn.alpha = 1; pn.transform = ident; } completion:nil];
     } else {
         if (pn.hidden) return;
         g_panelClosing = YES;
@@ -2379,7 +2382,7 @@ static BOOL g_panelClosing = NO;
                          animations:^{ pn.alpha = 0; pn.transform = away; }
                          completion:^(BOOL fin) {
             if (!g_panelClosing) return;                        // re-opened while closing
-            g_panelClosing = NO; pn.hidden = YES; pn.transform = CGAffineTransformIdentity; pn.alpha = 1;
+            g_panelClosing = NO; pn.hidden = YES; pn.transform = ident; pn.alpha = 1;
         }];
     }
 }
