@@ -52,7 +52,6 @@ static const char *kChamShaders[] = { "Hidden/Internal-Colored", "GUI/Text Shade
 static const char *kBoneSkip[] = { "root", "ik", "target", "pole", "weapon", "gun" };
 // bones further than this from the player pivot are junk (IK helpers, world-origin bones)
 static const float kBelowFeet = 0.3f, kMaxReach = 2.0f;
-static const CGFloat kBarW = 2.0;      // health / armor bar thickness in px
 static const float kAimFov = 18.0f;   // degrees: aim lock only grabs targets this close to the crosshair
 
 // ---- aim body-part selection ------------------------------------------------------------
@@ -81,7 +80,8 @@ struct Settings {
     bool bhop = false;      // enable the game's built-in bunny-hop movement flag on the local player
     bool bhopCustom = false;                                  // apply the multipliers below to the game's bhop parameters
     float bhopStep = 1.0f, bhopMax = 1.0f, bhopReset = 1.0f;  // multipliers: speed step / max speed / reset time
-    int color = 0;
+    int color = 0;          // 0..6 = preset swatch, -1 = custom colour from the picker (hue/sat/val below)
+    float ch = 0.0f, cs = 0.85f, cv = 1.0f;
     float lw = 1.5f;
     float head = 1.8f;
     float fov = 45.0f;      // aim capture cone, degrees
@@ -90,12 +90,13 @@ struct Settings {
     bool dmg = true;        // floating damage numbers
     bool dmgMine = true;    // damage numbers only for hits taken while the target is under my crosshair
     bool armor = true;      // armor bar (right of the box) + armor-flag marker, from PlayerController.odf()/odg()
-    bool wep = true;        // weapon name under the box (PlayerController -> Weaponry -> WeaponController -> WeaponParameters._shortName)
+    bool wep = true;        // weapon name under the box
 };
 static Settings g_set;
 static bool g_dirty = true;
 
 static UIColor *colorFor(int i, CGFloat a) {
+    if (i < 0) return [UIColor colorWithHue:g_set.ch saturation:g_set.cs brightness:g_set.cv alpha:a];
     switch (i) {
         case 0: return [UIColor colorWithRed:1 green:0.15 blue:0.15 alpha:a];
         case 1: return [UIColor colorWithRed:0.1 green:1 blue:0.2 alpha:a];
@@ -119,6 +120,7 @@ static void saveSettings() {
     [d setBool:g_set.bhopCustom forKey:@"scesp_bhcus"];
     [d setFloat:g_set.bhopStep forKey:@"scesp_bhstep"]; [d setFloat:g_set.bhopMax forKey:@"scesp_bhmax"]; [d setFloat:g_set.bhopReset forKey:@"scesp_bhrst"];
     [d setInteger:g_set.color forKey:@"scesp_color"];
+    [d setFloat:g_set.ch forKey:@"scesp_ch"]; [d setFloat:g_set.cs forKey:@"scesp_cs"]; [d setFloat:g_set.cv forKey:@"scesp_cv"];
     [d setFloat:g_set.lw forKey:@"scesp_lw"];      [d setFloat:g_set.head forKey:@"scesp_head"];
     [d setFloat:g_set.fov forKey:@"scesp_fov"];
     [d setFloat:g_set.aimSpeed forKey:@"scesp_aspd"];
@@ -145,6 +147,12 @@ static void loadSettings() {
     g_set.bhopReset = [d floatForKey:@"scesp_bhrst"];   if (g_set.bhopReset < 0.1f) g_set.bhopReset = 1.0f;
     g_set.hp = [d objectForKey:@"scesp_hp"] ? [d boolForKey:@"scesp_hp"] : true;
     g_set.color = (int)[d integerForKey:@"scesp_color"];
+    if ([d objectForKey:@"scesp_ch"]) {
+        g_set.ch = [d floatForKey:@"scesp_ch"]; g_set.cs = [d floatForKey:@"scesp_cs"]; g_set.cv = [d floatForKey:@"scesp_cv"];
+    } else {                                                       // first run with the picker: start from the saved preset
+        CGFloat h = 0, sa = 0.85, v = 1, al = 1;
+        if ([colorFor(g_set.color < 0 ? 0 : g_set.color, 1) getHue:&h saturation:&sa brightness:&v alpha:&al]) { g_set.ch = h; g_set.cs = sa; g_set.cv = v; }
+    }
     g_set.lw = [d floatForKey:@"scesp_lw"];        g_set.head = [d floatForKey:@"scesp_head"];
     if (g_set.lw < 0.5f) g_set.lw = 1.5f;
     if (g_set.head < 1.0f) g_set.head = 1.8f;
@@ -341,6 +349,9 @@ static std::vector<int> g_teamOffsets;
 static int g_teamField = -1;
 
 static void *k_smr, *k_material, *k_shader;
+// chams through a CommandBuffer on the camera (draws regardless of culling / occlusion, like the game's own HighlightEffect)
+static void *k_cmdbuf, *mi_cb_ctor, *mi_cb_clear, *mi_cb_draw2, *mi_cb_draw3, *mi_cam_addcb, *mi_cam_rmcb;
+static bool g_cbActive = false;
 static void *mi_find, *mi_get_bones, *mi_get_smats, *mi_set_smats, *mi_find_shader, *mi_mat_ctor;
 static void *mi_set_color, *mi_set_queue, *mi_setint, *mi_setglobal, *mi_get_name, *mi_hasprop;
 static void *k_animator, *k_occsys;
@@ -583,6 +594,18 @@ static bool resolveAll() {
         mi_set_queue = il2_get_method(k_material, "set_renderQueue", 1);
         mi_setint    = findMethod(k_material, "SetInt", 2, "System.String");
         mi_hasprop   = findMethod(k_material, "HasProperty", 1, "System.String");
+    }
+    {   // CommandBuffer chams: everything optional, a miss just keeps the old material-swap path
+        k_cmdbuf = il2_class_from_name(core, "UnityEngine.Rendering", "CommandBuffer");
+        if (k_cmdbuf) {
+            mi_cb_ctor  = il2_get_method(k_cmdbuf, ".ctor", 0);
+            mi_cb_clear = il2_get_method(k_cmdbuf, "Clear", 0);
+            mi_cb_draw2 = findMethod(k_cmdbuf, "DrawRenderer", 2, "UnityEngine.Renderer");
+            mi_cb_draw3 = findMethod(k_cmdbuf, "DrawRenderer", 3, "UnityEngine.Renderer");
+        }
+        mi_cam_addcb = findMethod(cCamera, "AddCommandBuffer", 2, "UnityEngine.Rendering.CameraEvent");
+        mi_cam_rmcb  = findMethod(cCamera, "RemoveCommandBuffer", 2, "UnityEngine.Rendering.CameraEvent");
+        NSLog(@"[SCESP] cmdbuf: class=%p ctor=%p clear=%p draw2=%p draw3=%p add=%p rm=%p", k_cmdbuf, mi_cb_ctor, mi_cb_clear, mi_cb_draw2, mi_cb_draw3, mi_cam_addcb, mi_cam_rmcb);
     }
 
     for (int i = 0; i < kN; i++) k_targets[i] = il2_class_from_name(game, kTargets[i].ns, kTargets[i].name);
@@ -1161,8 +1184,8 @@ static std::unordered_map<void *, float> g_hpMax;
 struct DmgPop { void *id; V3 pos; float amount; double t0; };
 struct DmgDraw { CGPoint p; float a, amt, k; };
 // value text inside a bar: x = bar centre, y = bar top; side<0 = hp bar, side>0 = armor bar
-struct BarTxt { CGFloat x, y; int v, side; float ratio; CGFloat h; };
-struct WepTxt { CGFloat x, y; char s[24]; };                 // weapon name under the box: x = box centre, y = box bottom
+struct BarTxt { CGFloat x, y; int v, side; float ratio; };
+struct WepTxt { CGFloat x, y; char s[24]; };
 static std::vector<DmgPop> g_pops;
 static std::unordered_map<void *, float> g_hpPrev;      // last HP seen per character; a drop = damage taken
 static void dmgSpawn(void *id, V3 pos, float amt, double now) {
@@ -1550,6 +1573,78 @@ static void reconcileChams(const std::vector<void *> &want) {
 }
 
 
+// ---- chams via CommandBuffer -------------------------------------------------------------
+// One CommandBuffer is attached to the main camera (AfterForwardAlpha) and records DrawRenderer(enemy, chamMaterial).
+// The material has ZTest Always, so the enemy is painted over walls; DrawRenderer does not care whether the
+// renderer was culled or occluded this frame, and the game cannot swap our material away (nothing is swapped).
+static uint32_t g_cb = 0, g_cbCam = 0;
+static std::vector<void *> g_cbList;
+static bool g_cbFailed = false;
+static const int kCamAfterForwardAlpha = 17;
+
+static bool invOk(void *mi, void *obj, void **args) {
+    if (!mi) return false;
+    void *exc = nullptr;
+    il2_invoke(mi, obj, args, &exc);
+    return exc == nullptr;
+}
+static bool cbReady() { return !g_cbFailed && k_cmdbuf && mi_cb_ctor && mi_cb_clear && (mi_cb_draw2 || mi_cb_draw3) && mi_cam_addcb; }
+static void cbDetach() {
+    void *cb = g_cb ? il2_gc_get(g_cb) : nullptr;
+    void *oc = g_cbCam ? il2_gc_get(g_cbCam) : nullptr;
+    if (cb && oc && alive(oc) && mi_cam_rmcb) { int ev = kCamAfterForwardAlpha; void *a[2] = { &ev, cb }; invOk(mi_cam_rmcb, oc, a); }
+    if (g_cbCam) { il2_gc_free(g_cbCam); g_cbCam = 0; }
+}
+static void cbClear() {
+    void *cb = g_cb ? il2_gc_get(g_cb) : nullptr;
+    if (cb) invOk(mi_cb_clear, cb, nullptr);
+    g_cbList.clear();
+}
+// true = the buffer path is drawing the chams (caller must then NOT swap materials)
+static bool cbUpdate(void *cam, const std::vector<void *> &want) {
+    if (!cbReady() || !cam || !alive(cam)) return false;
+    if (!ensureChamMaterial() || (g_chamMode != 0 && g_chamMode != 3)) return false;   // needs a shader with ZTest Always
+    void *mat = il2_gc_get(g_chamMat);
+    if (!mat) return false;
+    if (!g_cb) {
+        void *nb = il2_object_new(k_cmdbuf);
+        if (!nb || !invOk(mi_cb_ctor, nb, nullptr)) { g_cbFailed = true; return false; }
+        g_cb = il2_gc_new(nb, 0);
+    }
+    void *cb = il2_gc_get(g_cb);
+    if (!cb) { g_cb = 0; return false; }
+    void *cur = g_cbCam ? il2_gc_get(g_cbCam) : nullptr;
+    bool relist = false;
+    if (cur != cam || !alive(cur)) {                       // new camera (round change / scene load)
+        if (g_cbCam) cbDetach();
+        int ev = kCamAfterForwardAlpha; void *a[2] = { &ev, cb };
+        if (!invOk(mi_cam_addcb, cam, a)) { g_cbFailed = true; return false; }
+        g_cbCam = il2_gc_new(cam, 0);
+        relist = true;
+        NSLog(@"[SCESP] chams: CommandBuffer attached to camera %p", cam);
+    }
+    if (relist || want.size() != g_cbList.size() || !std::equal(want.begin(), want.end(), g_cbList.begin())) {
+        cbClear();
+        for (void *r : want) {
+            if (!r || !alive(r)) continue;
+            uintptr_t n = 1;
+            if (mi_get_smats && mi_cb_draw3) {
+                void *arr = inv(mi_get_smats, r, nullptr);
+                if (arr) { n = *(uintptr_t *)((char *)arr + 24); if (n < 1 || n > 8) n = 1; }
+            }
+            for (uintptr_t i = 0; i < n; i++) {
+                bool ok;
+                if (mi_cb_draw3) { int sub = (int)i; void *a[3] = { r, mat, &sub }; ok = invOk(mi_cb_draw3, cb, a); }
+                else             { void *a[2] = { r, mat };                           ok = invOk(mi_cb_draw2, cb, a); if (i == 0) {} }
+                if (!ok) { g_cbFailed = true; cbClear(); return false; }
+                if (!mi_cb_draw3) break;                    // the 2-arg overload only does submesh 0
+            }
+        }
+        g_cbList = want;
+    }
+    return true;
+}
+
 // ---- class/method dump (for finding the fire path) ----------------------------------------
 // Panel button "Dump -> clipboard": every class of the game image whose name looks shooting-related,
 // with the methods that look relevant: signature + RVA (address minus image base).
@@ -1671,6 +1766,82 @@ static inline CGFloat nlMidY(CGRect r) { return r.origin.y + r.size.height * 0.5
 @end
 @implementation NLScroll
 - (BOOL)touchesShouldCancelInContentView:(UIView *)view { return YES; }
+@end
+
+// ---- colour picker: saturation/brightness square + hue strip ---------------------------------
+@interface NLColorPicker : UIControl
+- (CGFloat)hue; - (CGFloat)sat; - (CGFloat)val;
+- (void)setHue:(CGFloat)h sat:(CGFloat)s val:(CGFloat)v;
+@end
+@implementation NLColorPicker {
+    CALayer *_svBase, *_svKnob, *_hueKnob;
+    CAGradientLayer *_svWhite, *_svBlack, *_hueBar;
+    CGFloat _h, _s, _v;
+    int _mode;                                   // 1 = dragging in the square, 2 = dragging on the hue strip
+    __weak UIScrollView *_scroll;
+}
+- (CGFloat)hue { return _h; }
+- (CGFloat)sat { return _s; }
+- (CGFloat)val { return _v; }
+static CALayer *nlKnob() {
+    CALayer *k = [CALayer layer];
+    k.bounds = CGRectMake(0, 0, 15, 15); k.cornerRadius = 7.5; k.borderWidth = 2; k.borderColor = UIColor.whiteColor.CGColor;
+    k.shadowColor = UIColor.blackColor.CGColor; k.shadowOpacity = 0.6; k.shadowRadius = 2; k.shadowOffset = CGSizeZero;
+    return k;
+}
+- (instancetype)initWithFrame:(CGRect)f {
+    self = [super initWithFrame:f];
+    if (!self) return nil;
+    CGFloat w = f.size.width, svH = f.size.height - 24;
+    _svBase = [CALayer layer]; _svBase.frame = CGRectMake(0, 0, w, svH); _svBase.cornerRadius = 6; _svBase.masksToBounds = YES;
+    _svWhite = [CAGradientLayer layer]; _svWhite.frame = _svBase.bounds;
+    _svWhite.colors = @[ (id)UIColor.whiteColor.CGColor, (id)[UIColor colorWithWhite:1 alpha:0].CGColor ];
+    _svWhite.startPoint = CGPointMake(0, 0.5); _svWhite.endPoint = CGPointMake(1, 0.5);
+    _svBlack = [CAGradientLayer layer]; _svBlack.frame = _svBase.bounds;
+    _svBlack.colors = @[ (id)[UIColor colorWithWhite:0 alpha:0].CGColor, (id)UIColor.blackColor.CGColor ];
+    _svBlack.startPoint = CGPointMake(0.5, 0); _svBlack.endPoint = CGPointMake(0.5, 1);
+    [_svBase addSublayer:_svWhite]; [_svBase addSublayer:_svBlack]; [self.layer addSublayer:_svBase];
+    _hueBar = [CAGradientLayer layer]; _hueBar.frame = CGRectMake(0, f.size.height - 16, w, 16);
+    _hueBar.cornerRadius = 8; _hueBar.masksToBounds = YES;
+    NSMutableArray *cols = [NSMutableArray array];
+    for (int i = 0; i <= 6; i++) [cols addObject:(id)[UIColor colorWithHue:i / 6.0 saturation:1 brightness:1 alpha:1].CGColor];
+    _hueBar.colors = cols; _hueBar.startPoint = CGPointMake(0, 0.5); _hueBar.endPoint = CGPointMake(1, 0.5);
+    [self.layer addSublayer:_hueBar];
+    _svKnob = nlKnob(); _hueKnob = nlKnob();
+    [self.layer addSublayer:_svKnob]; [self.layer addSublayer:_hueKnob];
+    _h = 0; _s = 0.85; _v = 1;
+    [self refresh];
+    return self;
+}
+- (void)refresh {
+    CGFloat w = self.bounds.size.width, hh = self.bounds.size.height, svH = hh - 24;
+    [CATransaction begin]; [CATransaction setDisableActions:YES];
+    _svBase.backgroundColor = [UIColor colorWithHue:_h saturation:1 brightness:1 alpha:1].CGColor;
+    _svKnob.position = CGPointMake(_s * w, (1 - _v) * svH);
+    _svKnob.backgroundColor = [UIColor colorWithHue:_h saturation:_s brightness:_v alpha:1].CGColor;
+    _hueKnob.position = CGPointMake(fmax(8, fmin(w - 8, _h * w)), hh - 8);
+    _hueKnob.backgroundColor = [UIColor colorWithHue:_h saturation:1 brightness:1 alpha:1].CGColor;
+    [CATransaction commit];
+}
+- (void)setHue:(CGFloat)h sat:(CGFloat)s val:(CGFloat)v { _h = h; _s = s; _v = v; [self refresh]; }
+- (void)applyPoint:(CGPoint)p {
+    CGFloat w = self.bounds.size.width, svH = self.bounds.size.height - 24;
+    if (_mode == 2) _h = fmax(0, fmin(1, p.x / w));
+    else { _s = fmax(0, fmin(1, p.x / w)); _v = 1 - fmax(0, fmin(1, p.y / svH)); }
+    [self refresh];
+    [self sendActionsForControlEvents:UIControlEventValueChanged];
+}
+- (BOOL)beginTrackingWithTouch:(UITouch *)t withEvent:(UIEvent *)e {
+    CGPoint p = [t locationInView:self];
+    _mode = (p.y > self.bounds.size.height - 24 + 2) ? 2 : 1;
+    for (UIView *v = self.superview; v; v = v.superview) if ([v isKindOfClass:UIScrollView.class]) { _scroll = (UIScrollView *)v; break; }
+    _scroll.scrollEnabled = NO;                   // a vertical drag inside the square must not scroll the page
+    [self applyPoint:p];
+    return YES;
+}
+- (BOOL)continueTrackingWithTouch:(UITouch *)t withEvent:(UIEvent *)e { [self applyPoint:[t locationInView:self]]; return YES; }
+- (void)endTrackingWithTouch:(UITouch *)t withEvent:(UIEvent *)e { _scroll.scrollEnabled = YES; _scroll = nil; }
+- (void)cancelTrackingWithEvent:(UIEvent *)e { _scroll.scrollEnabled = YES; _scroll = nil; }
 @end
 
 struct NLCard { __unsafe_unretained UIView *v; CGFloat y, w; };
@@ -1816,6 +1987,8 @@ static SCNNode *buildAgentModel() {
     UILabel *_bhStepLabel, *_bhMaxLabel, *_bhRstLabel, *_bhopInfo;
     CAShapeLayer *_fovRing;
     NSMutableArray *_pages, *_tabs, *_swatches, *_dmgLabels;
+    NLColorPicker *_picker;
+    UILabel *_hexLabel;
     NSMutableArray *_aimPartButtons, *_aimChipButtons;
     SCNView *_agentView; SCNNode *_agentRoot;
     UILabel *_aimPartInfo;
@@ -2009,7 +2182,18 @@ static SCNNode *buildAgentModel() {
         nlToggle(a, @"Teammates", 5, g_set.team, self, @selector(swChanged:));
         nlEnd(a);
         NLCard b = nlCard(pg, @"Style", CW + 8, 0, CW);
-        nlSwatches(b, g_set.color, self, @selector(colorTapped:), _swatches);
+        {
+            NLColorPicker *cp = [[NLColorPicker alloc] initWithFrame:CGRectMake(10, b.y, b.w - 20, 112)];
+            [cp setHue:g_set.ch sat:g_set.cs val:g_set.cv];
+            [cp addTarget:self action:@selector(pickChanged:) forControlEvents:UIControlEventValueChanged];
+            [cp addTarget:self action:@selector(pickDone) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
+            [b.v addSubview:cp]; _picker = cp; b.y += 118;
+            _hexLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, b.y, b.w - 20, 14)];
+            _hexLabel.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightSemibold]; _hexLabel.textColor = NL_ACCENT;
+            _hexLabel.textAlignment = NSTextAlignmentCenter;
+            [b.v addSubview:_hexLabel]; b.y += 18;
+            [self updateHex];
+        }
         _lwLabel = nlSlider(b, @"Line width", 10, 0.5, 4, g_set.lw, self, @selector(slChanged:));
         _hdLabel = nlSlider(b, @"Box height", 11, 1.4, 2.2, g_set.head, self, @selector(slChanged:));
         nlEnd(b);
@@ -2101,8 +2285,25 @@ static SCNNode *buildAgentModel() {
     saveSettings();
     [self refreshAimPartPreview];
 }
+- (void)updateHex {
+    CGFloat r = 0, g = 0, bl = 0, a = 0;
+    [colorFor(g_set.color, 1) getRed:&r green:&g blue:&bl alpha:&a];
+    _hexLabel.text = [NSString stringWithFormat:@"#%02X%02X%02X", (int)lround(r * 255), (int)lround(g * 255), (int)lround(bl * 255)];
+}
+- (void)pickChanged:(NLColorPicker *)p {
+    g_set.ch = [p hue]; g_set.cs = [p sat]; g_set.cv = [p val]; g_set.color = -1;      // custom colour
+    for (UIButton *sw in _swatches) sw.layer.borderWidth = 0;
+    g_dirty = true; [self updateHex];
+}
+- (void)pickDone { saveSettings(); }
 - (void)colorTapped:(UIButton *)b {
-    g_set.color = (int)b.tag; g_dirty = true; saveSettings();
+    g_set.color = (int)b.tag; g_dirty = true;
+    {   // keep the picker in sync with the preset
+        CGFloat h = 0, sa = 0, v = 0, al = 0;
+        if ([colorFor(g_set.color, 1) getHue:&h saturation:&sa brightness:&v alpha:&al]) { g_set.ch = h; g_set.cs = sa; g_set.cv = v; [_picker setHue:h sat:sa val:v]; }
+        [self updateHex];
+    }
+    saveSettings();
     for (UIButton *sw in _swatches) sw.layer.borderWidth = (sw.tag == b.tag) ? 2 : 0;
 }
 
@@ -2158,7 +2359,30 @@ static SCNNode *buildAgentModel() {
     if (s.tag == 10) g_set.lw = s.value; else if (s.tag == 13) g_set.fov = s.value; else if (s.tag == 14) g_set.aimSpeed = s.value; else if (s.tag == 21) g_set.bhopStep = s.value; else if (s.tag == 22) g_set.bhopMax = s.value; else if (s.tag == 23) g_set.bhopReset = s.value; else g_set.head = s.value;
     [self refreshLabels]; saveSettings();
 }
-- (void)plateTapped { _panel.hidden = !_panel.hidden; }
+static BOOL g_panelClosing = NO;
+- (void)plateTapped { [self setPanelOpen:(_panel.hidden || g_panelClosing)]; }
+// menu open / close: fade + small scale + slide; opening has a light spring, closing is a quick ease-in
+- (void)setPanelOpen:(BOOL)open {
+    UIView *pn = _panel;
+    CGAffineTransform away = CGAffineTransformConcat(CGAffineTransformMakeScale(open ? 0.92 : 0.95, open ? 0.92 : 0.95), CGAffineTransformMakeTranslation(0, -10));
+    if (open) {
+        g_panelClosing = NO;
+        if (pn.hidden) { pn.alpha = 0; pn.transform = away; pn.hidden = NO; }
+        else if (pn.alpha > 0.99) return;
+        [UIView animateWithDuration:0.28 delay:0 usingSpringWithDamping:0.82 initialSpringVelocity:0.4
+                            options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
+                         animations:^{ pn.alpha = 1; pn.transform = CGAffineTransformIdentity; } completion:nil];
+    } else {
+        if (pn.hidden) return;
+        g_panelClosing = YES;
+        [UIView animateWithDuration:0.18 delay:0 options:UIViewAnimationOptionCurveEaseIn | UIViewAnimationOptionBeginFromCurrentState
+                         animations:^{ pn.alpha = 0; pn.transform = away; }
+                         completion:^(BOOL fin) {
+            if (!g_panelClosing) return;                        // re-opened while closing
+            g_panelClosing = NO; pn.hidden = YES; pn.transform = CGAffineTransformIdentity; pn.alpha = 1;
+        }];
+    }
+}
 - (void)dumpFieldsTapped { useDumpFields(); }
 - (void)learnTapped {
     if (!g_ready) return;
@@ -2428,24 +2652,24 @@ static SCNNode *buildAgentModel() {
                             if (mx < (mi_hp ? 100.f : g_hpRef)) mx = mi_hp ? 100.f : g_hpRef;
                             if (hv > mx) mx = hv;
                             CGFloat ratio = fminf(1.f, hv / mx);
-                            CGFloat bw = kBarW, bx = r.origin.x - bw - 3;     // wide enough for the number inside the bar
+                            CGFloat bw = 2.0, bx = r.origin.x - bw - 3;     // wide enough for the number inside the bar
                             [hpBack appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(bx - 1, r.origin.y - 1, bw + 2, r.size.height + 2)]];
                             CGFloat fh = r.size.height * ratio;
                             UIBezierPath *tgt = ratio > 0.6 ? hpG : (ratio > 0.3 ? hpY : hpR);
                             [tgt appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(bx, r.origin.y + r.size.height - fh, bw, fh)]];
-                            bt.push_back({ bx + bw * 0.5, r.origin.y, (int)lroundf(hv), -1, (float)ratio, r.size.height });
+                            bt.push_back({ bx + bw * 0.5, r.origin.y, (int)lroundf(hv), -1, (float)ratio });
                         }
                         // armor bar: right side of the box, blue (the gold odg() flag dot was removed)
                         if (wantArmor && !(hpOk && hpv <= 0.f)) {
                             int av = 0; bool flag = false;
                             if (readArmor(p.obj, av, flag) && av > 0) {
-                                CGFloat bw = kBarW, ax = r.origin.x + r.size.width + 3;
+                                CGFloat bw = 2.0, ax = r.origin.x + r.size.width + 3;
                                 if (av > 0) {
                                     CGFloat ratio = fminf(1.f, (float)av / 100.f);
                                     [hpBack appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(ax - 1, r.origin.y - 1, bw + 2, r.size.height + 2)]];
                                     CGFloat fh = r.size.height * ratio;
                                     [armPath appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(ax, r.origin.y + r.size.height - fh, bw, fh)]];
-                                    bt.push_back({ ax + bw * 0.5, r.origin.y, av, 1, (float)ratio, r.size.height });
+                                    bt.push_back({ ax + bw * 0.5, r.origin.y, av, 1, (float)ratio });
                                 }
                             }
                         }
@@ -2548,15 +2772,25 @@ static SCNNode *buildAgentModel() {
     }
 
     if (!wantChams.empty()) diagR = wantChams[0];
+    {   // CommandBuffer chams every tick (cheap: only re-records when the list changes)
+        bool cbOn = false;
+        @try {
+            std::vector<void *> wc;
+            if (g_set.on && g_set.chams) wc = wantChams;
+            if (wc.empty()) { if (g_cb) cbClear(); }
+            else cbOn = cbUpdate((mi_cam_main && d_cam_main) ? d_cam_main(mi_cam_main) : nullptr, wc);
+        } @catch (...) {}
+        g_cbActive = cbOn;
+    }
     if (g_dirty || scanNow || !g_set.on) {
         @try {
-            if (!g_set.on || !g_set.chams) wantChams.clear();
+            if (!g_set.on || !g_set.chams || g_cbActive) wantChams.clear();   // buffer path active -> undo any material swaps
             reconcileChams(wantChams);
             if (g_dirty) updateChamColor();
         } @catch (...) {}
         g_dirty = false;
     }
-    @try { if (g_set.on && g_set.chams && !g_chams.empty() && (++_vfy % 6 == 0)) verifyChams(); } @catch (...) {}
+    @try { if (g_set.on && g_set.chams && !g_cbActive && !g_chams.empty() && (++_vfy % 6 == 0)) verifyChams(); } @catch (...) {}
     @try { pumpChamZTest(); } @catch (...) {}
 
     [CATransaction begin];
@@ -2606,24 +2840,12 @@ static SCNNode *buildAgentModel() {
         UILabel *bl = _barLabels[i];
         if (i >= bt.size()) { bl.hidden = YES; continue; }
         const BarTxt &t = bt[i];
-        // digits stacked top-to-bottom inside the bar: 100 -> 1 / 0 / 0
-        NSString *num = [NSString stringWithFormat:@"%d", t.v];
-        int nd = (int)num.length;
-        float fs = fminf((float)(kBarW * 1.75), fmaxf(2.5f, (float)(t.h - 2.0) / (float)nd));   // follows bar width, shrinks on far bars
-        NSMutableString *stk = [NSMutableString string];
-        for (int c = 0; c < nd; c++) {
-            if (c) [stk appendString:@"\n"];
-            [stk appendString:[num substringWithRange:NSMakeRange(c, 1)]];
-        }
-        bl.numberOfLines = 0;
-        bl.textAlignment = NSTextAlignmentCenter;
-        bl.font = [UIFont monospacedDigitSystemFontOfSize:fs weight:UIFontWeightHeavy];
-        bl.textColor = UIColor.whiteColor;
-        bl.text = stk;
-        CGFloat bwid = kBarW + 4;
-        CGFloat lh = bl.font.lineHeight;
-        bl.frame = CGRectMake(t.x - bwid * 0.5, t.y + 1, bwid, lh * nd);
-        bl.hidden = NO;
+        bl.text = [NSString stringWithFormat:@"%d", t.v];
+        bl.textColor = UIColor.whiteColor;                        // white on the bar, black shadow keeps it readable on any fill
+        [bl sizeToFit];
+        CGRect f = bl.frame; f.origin.y = t.y + 1;               // inside the bar, at its top
+        f.origin.x = t.x - f.size.width * 0.5;                   // centred on the bar
+        bl.frame = f; bl.hidden = NO;
     }
     // weapon names under the boxes
     if (!_wepLabels) _wepLabels = [NSMutableArray array];
@@ -2653,7 +2875,7 @@ static SCNNode *buildAgentModel() {
         NSString *sh = g_chamShaderUsed ? [NSString stringWithUTF8String:g_chamShaderUsed] : (g_chamFailed ? @"no shader" : @"-");
         _status.text = [NSString stringWithFormat:@"found %@ | team f%d me%d | draw %d | cam %@\nchams %@ %s %zu re%d | occ %s",
                         cs, g_teamField, myTeam, drawn, camOk ? @"ok" : @"-", [sh lastPathComponent],
-                        g_chamMode == 2 ? "noX" : "xray", g_chams.size(), g_chamReapply,
+                        g_chamMode == 2 ? "noX" : (g_cbActive ? "xray+cb" : "xray"), g_chams.size(), g_chamReapply,
                         g_occOff ? "off" : "on"];
         @try {
             NSString *l3 = (g_learn || now < g_msgUntil) ? g_learnMsg
