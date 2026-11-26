@@ -1,4 +1,4 @@
-// SCESP.mm v5.7 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
+// SCESP.mm v5.8 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
 //
 // Box / skeleton / chams / box fill / health bar, enemies only (teammates optional), settings panel.
 // Tap the small "ESP" plate (top-left) to open/close the settings panel.
@@ -18,6 +18,13 @@
 //   v5.7: full bhop settings (Misc > Movement): "Custom values" + Speed step / Max speed / Reset time sliders. The three floats are
 //   found at runtime by field name (no hardcoded offsets); sliders are multipliers of the game's own value, so units never matter.
 //   Untick Custom values (or Bunny hop) and the game's original values are written back.
+// - custom hands / viewmodel (v5.8, Misc > Viewmodel): the game has its own CustomViewModel settings (PositionOffset, RotationOffset,
+//   AdditiveFov inside GameSettings). The live GameSettings object is found at runtime (object-graph walk + static fields of *Settings*
+//   classes), our values are written into it BY FIELD NAME and PlayerController.obu(GameSettings) is called to re-apply. Originals are
+//   saved and put back when the toggle goes off. "Hands type"/"FOV type" overwrite the two (obfuscated) enums; -1 = leave alone. The panel
+//   prints the enum members it can read, so you can see which number is which.
+// - stretch (v5.8, Misc > Stretch): Screen.SetResolution(height*aspect, height). iOS scales the smaller backbuffer to the whole screen.
+//   The ESP overlay keeps lining up because it maps world->screen with the current Screen.width/height every tick.
 // - hot path uses direct method-pointer calls; drawing is 30 fps, scan about once a second
 //
 // Not compiled or run on a device by me. If something misbehaves, the panel's status line says where.
@@ -30,6 +37,7 @@
 #include <string.h>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <ctype.h>
 #include <string>
 #include <algorithm>
@@ -91,6 +99,10 @@ struct Settings {
     bool dmgMine = true;    // damage numbers only for hits taken while the target is under my crosshair
     bool armor = true;      // armor bar (right of the box) + armor-flag marker, from PlayerController.odf()/odg()
     bool wep = true;        // weapon name under the box
+    bool vm = false;        // custom hands position (game's CustomViewModel)
+    float vmv[9] = { 0, 0, 0, 0, 0, 0, 0, -1, -1 };   // posX posY posZ rotX rotY rotZ addFov handsType(-1=keep) fovType(-1=keep)
+    bool stretch = false;   // stretched resolution
+    float stretchAspect = 1.3333f;                      // width/height of the render target
 };
 static Settings g_set;
 static bool g_dirty = true;
@@ -130,6 +142,10 @@ static void saveSettings() {
     [d setBool:g_set.armor forKey:@"scesp_armor"];
     [d setBool:g_set.wep forKey:@"scesp_wep"];
     [d setInteger:g_selectedAimPart forKey:@"scesp_aim_part"];
+    [d setBool:g_set.vm forKey:@"scesp_vm"];
+    for (int i = 0; i < 9; i++) [d setFloat:g_set.vmv[i] forKey:[NSString stringWithFormat:@"scesp_vm%d", i]];
+    [d setBool:g_set.stretch forKey:@"scesp_st"];
+    [d setFloat:g_set.stretchAspect forKey:@"scesp_stasp"];
 }
 static void loadSettings() {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -165,6 +181,14 @@ static void loadSettings() {
     g_set.wep = [d objectForKey:@"scesp_wep"] ? [d boolForKey:@"scesp_wep"] : true;
     g_selectedAimPart = (int)[d integerForKey:@"scesp_aim_part"];
     if (g_selectedAimPart < 0 || g_selectedAimPart >= kAimPartCount) g_selectedAimPart = kAimHead;
+    g_set.vm = [d boolForKey:@"scesp_vm"];
+    for (int i = 0; i < 9; i++) {
+        NSString *key = [NSString stringWithFormat:@"scesp_vm%d", i];
+        if ([d objectForKey:key]) g_set.vmv[i] = [d floatForKey:key];
+    }
+    g_set.stretch = [d boolForKey:@"scesp_st"];
+    if ([d objectForKey:@"scesp_stasp"]) g_set.stretchAspect = [d floatForKey:@"scesp_stasp"];
+    if (g_set.stretchAspect < 1.0f || g_set.stretchAspect > 2.5f) g_set.stretchAspect = 1.3333f;
 }
 
 // ---- il2cpp API ------------------------------------------------------------------------
@@ -1008,6 +1032,298 @@ static size_t findObjs(void *klass, std::vector<void *> &out, size_t cap) {
     size_t n = 0;
     for (uintptr_t i = 0; i < len; i++) if (elems[i]) { out.push_back(elems[i]); n++; }
     return n;
+}
+
+// ---- custom hands position (viewmodel) + stretched resolution (v5.8) ----------------------------------------------
+// Static dump, StandChillow 2.07:  GameSettings { +0x1C FieldOfViewType(enum), +0x20 CustomViewModel, +0x2C HandsPositionType(enum) }
+//   CustomViewModel { +0x10 PositionOffset(Vector3), +0x1C RotationOffset(Vector3), +0x28 AdditiveFov(float) }
+//   PlayerController.obu(GameSettings) @0x281EC8C is the settings callback of the local player; PlayerFPSCamera.betr(GameSettings) @0x2762F18.
+// Offsets above are only fallbacks; everything is looked up by field name first. Nothing here was run on a device.
+typedef void *(*fn_object_get_class)(void *);
+typedef const char *(*fn_class_get_name)(void *);
+typedef size_t (*fn_image_class_count)(void *);
+typedef void *(*fn_image_get_class)(void *, size_t);
+typedef void (*fn_field_static_get)(void *, void *);
+typedef void *(*fn_class_elem)(void *);
+static fn_object_get_class il2_obj_class;
+static fn_class_get_name il2_class_name;
+static fn_image_class_count il2_img_count;
+static fn_image_get_class il2_img_class;
+static fn_field_static_get il2_static_get;
+static fn_class_elem il2_class_elem;
+
+static bool g_vmApiTried = false, g_vmApi = false;
+static void *k_gs, *k_cvm, *k_fpscam, *mi_obu, *mi_betr;
+static uint32_t g_gsH = 0;                    // gchandle of the live GameSettings (0 = not found yet)
+static double g_vmLastFind = 0;
+static int g_offCvm = -1, g_offHands = -1, g_offFovT = -1, g_offPos = -1, g_offRot = -1, g_offFov = -1;
+static bool g_vmSaved = false, g_vmWasOn = false, g_vmForce = true;
+static float g_vmOrig[7];
+static int g_vmOrigHands = 0, g_vmOrigFovT = 0;
+static void *g_vmLastMe = nullptr;
+static int g_vmTick = 0;
+static NSString *g_vmMsg = @"viewmodel: off";
+static NSString *g_vmEnums = @"";
+
+static void *g_gameImg = nullptr;
+static void *gameImage() { if (!g_gameImg) g_gameImg = findImage(kGameImage); return g_gameImg; }
+
+static int fieldOffByName(void *klass, const char *name) {
+    if (!il2_field_name || !klass) return -1;
+    for (void *k = klass; k; k = il2_class_parent(k)) {
+        void *it = nullptr, *f;
+        while ((f = il2_class_fields(k, &it))) {
+            if (il2_field_flags && (il2_field_flags(f) & 0x10)) continue;      // static
+            const char *n = il2_field_name(f);
+            if (n && strcmp(n, name) == 0) return il2_field_offset(f);
+        }
+    }
+    return -1;
+}
+
+static void loadVmApi() {
+    if (g_vmApiTried) return;
+    g_vmApiTried = true;
+    il2_obj_class  = (fn_object_get_class)sym("il2cpp_object_get_class");
+    il2_class_name = (fn_class_get_name)sym("il2cpp_class_get_name");
+    il2_img_count  = (fn_image_class_count)sym("il2cpp_image_get_class_count");        // optional (static-field search)
+    il2_img_class  = (fn_image_get_class)sym("il2cpp_image_get_class");                // optional
+    il2_static_get = (fn_field_static_get)sym("il2cpp_field_static_get_value");        // optional
+    il2_class_elem = (fn_class_elem)sym("il2cpp_class_get_element_class");             // optional (arrays)
+    void *game = gameImage();
+    if (!game || !il2_obj_class || !il2_class_name || !il2_class_from_type || !il2_class_is_vt) { g_vmMsg = @"viewmodel: il2cpp api missing"; return; }
+    k_gs     = il2_class_from_name(game, "Chillow.StandChillow.Settings.Game", "GameSettings");
+    k_fpscam = il2_class_from_name(game, "Chillow.StandChillow.Cam", "PlayerFPSCamera");
+    if (k_pcls) mi_obu = findMethod(k_pcls, "obu", 1, "Chillow.StandChillow.Settings.Game.GameSettings");
+    if (k_fpscam) mi_betr = findMethod(k_fpscam, "betr", 1, "Chillow.StandChillow.Settings.Game.GameSettings");
+    g_vmApi = k_gs != nullptr;
+    NSLog(@"[SCESP] viewmodel: GameSettings=%p PlayerController.obu=%p FPSCamera.betr=%p", k_gs, mi_obu, mi_betr);
+    if (!g_vmApi) g_vmMsg = @"viewmodel: GameSettings class not found";
+}
+
+// ---- find the live GameSettings object: bounded walk over reference fields (+ reference arrays), never touches value types ----
+struct GsWalk { std::unordered_set<void *> seen; int budget; void *found; };
+static void gsWalk(void *obj, int depth, GsWalk &w) {
+    if (w.found || w.budget <= 0 || !plausibleObj(obj)) return;
+    if (!w.seen.insert(obj).second) return;
+    w.budget--;
+    void *k = il2_obj_class(obj);
+    if (!k) return;
+    if (k == k_gs) { w.found = obj; return; }
+    if (depth <= 0) return;
+    const char *cn = il2_class_name(k);
+    if (cn && cn[0] && cn[strlen(cn) - 1] == ']') {                  // array of references only
+        void *ek = il2_class_elem ? il2_class_elem(k) : nullptr;
+        if (!ek || il2_class_is_vt(ek)) return;
+        uintptr_t len = *(uintptr_t *)((char *)obj + 24);
+        if (len > 64) len = 64;
+        void **el = (void **)((char *)obj + 32);
+        for (uintptr_t i = 0; i < len && !w.found; i++) gsWalk(el[i], depth - 1, w);
+        return;
+    }
+    for (void *c = k; c && !w.found; c = il2_class_parent(c)) {
+        void *it = nullptr, *f;
+        while ((f = il2_class_fields(c, &it))) {
+            int fl = il2_field_flags ? il2_field_flags(f) : 0;
+            if (fl & 0x10) continue;                                 // static
+            void *ft = il2_field_type(f);
+            const char *tn = il2_type_name ? il2_type_name(ft) : nullptr;
+            if (tn && strstr(tn, "VAR")) continue;
+            void *fk = il2_class_from_type(ft);
+            if (!fk || il2_class_is_vt(fk)) continue;
+            int off = il2_field_offset(f);
+            if (off < 16 || off > 0x800) continue;
+            gsWalk(*(void **)((char *)obj + off), depth - 1, w);
+            if (w.found) return;
+        }
+    }
+}
+static void *findGameSettings(void *me) {
+    GsWalk w; w.budget = 12000; w.found = nullptr;
+    void *game = gameImage();
+    if (me) gsWalk(me, 3, w);
+    if (!w.found && game) {                                          // live behaviours that usually reference the settings
+        static const char *kRoots[][2] = {
+            { "Chillow.StandChillow.Cam", "PlayerFPSCamera" },
+            { "Chillow.StandChillow.Settings.Game", "GeneralGameSettingsController" },
+            { "Chillow.StandChillow.Settings.Game", "GameSettingsController" },
+            { "Chillow.StandChillow.Settings", "SettingsController" } };
+        for (auto &r : kRoots) {
+            void *k = il2_class_from_name(game, r[0], r[1]);
+            if (!k || !mi_find) continue;
+            std::vector<void *> objs; findObjs(k, objs, 8);
+            for (void *o : objs) { gsWalk(o, 3, w); if (w.found) break; }
+            if (w.found) break;
+        }
+    }
+    if (!w.found && game && il2_img_count && il2_img_class && il2_static_get) {   // statics of classes with "Settings" in the name
+        size_t n = il2_img_count(game);
+        for (size_t i = 0; i < n && !w.found; i++) {
+            void *k = il2_img_class(game, i);
+            const char *cn = k ? il2_class_name(k) : nullptr;
+            if (!cn || !strstr(cn, "Settings")) continue;
+            void *it = nullptr, *f;
+            while ((f = il2_class_fields(k, &it))) {
+                int fl = il2_field_flags ? il2_field_flags(f) : 0;
+                if (!(fl & 0x10) || (fl & 0x40)) continue;           // need real static storage
+                void *ft = il2_field_type(f);
+                const char *tn = il2_type_name ? il2_type_name(ft) : nullptr;
+                if (tn && strstr(tn, "VAR")) continue;
+                void *fk = il2_class_from_type(ft);
+                if (!fk || il2_class_is_vt(fk)) continue;
+                void *val = nullptr; il2_static_get(f, &val);
+                gsWalk(val, 3, w);
+                if (w.found) break;
+            }
+        }
+    }
+    NSLog(@"[SCESP] viewmodel: GameSettings search -> %p (nodes %d)", w.found, 12000 - w.budget);
+    return w.found;
+}
+
+// print the readable members of the two enums so the user can tell which number is which
+static void dumpEnumField(void *gs, const char *fname, NSMutableString *out) {
+    if (!il2_field_name || !il2_static_get) return;
+    for (void *k = k_gs; k; k = il2_class_parent(k)) {
+        void *it = nullptr, *f;
+        while ((f = il2_class_fields(k, &it))) {
+            const char *n = il2_field_name(f);
+            if (!n || strcmp(n, fname) != 0 || (il2_field_flags(f) & 0x10)) continue;
+            void *ek = il2_class_from_type(il2_field_type(f));
+            int cur = *(int *)((char *)gs + il2_field_offset(f));
+            [out appendFormat:@"%s=%d (%s):", fname, cur, ek ? il2_class_name(ek) : "?"];
+            void *it2 = nullptr, *ef; int cnt = 0;
+            while (ek && (ef = il2_class_fields(ek, &it2)) && cnt < 8) {
+                if (!(il2_field_flags(ef) & 0x10)) continue;
+                int v = 0; il2_static_get(ef, &v);
+                const char *en = il2_field_name(ef);
+                [out appendFormat:@" %s=%d", en ? en : "?", v]; cnt++;
+            }
+            [out appendString:@"\n"];
+            return;
+        }
+    }
+}
+
+static void vmRestore(void *gs, void *cvm) {
+    if (!g_vmSaved) return;
+    float *pos = (float *)((char *)cvm + g_offPos), *rot = (float *)((char *)cvm + g_offRot);
+    for (int i = 0; i < 3; i++) { pos[i] = g_vmOrig[i]; rot[i] = g_vmOrig[3 + i]; }
+    *(float *)((char *)cvm + g_offFov) = g_vmOrig[6];
+    *(int *)((char *)gs + g_offHands) = g_vmOrigHands;
+    *(int *)((char *)gs + g_offFovT) = g_vmOrigFovT;
+}
+
+static void applyViewmodel(void *me) {
+    bool want = g_set.vm;
+    if (!want && !g_vmWasOn) return;
+    loadVmApi();
+    if (!g_vmApi) return;
+    double now = CACurrentMediaTime();
+    void *gs = g_gsH ? il2_gc_get(g_gsH) : nullptr;
+    if (!gs) {
+        if (g_gsH) { il2_gc_free(g_gsH); g_gsH = 0; }
+        if (now - g_vmLastFind < 3.0 || !me) return;
+        g_vmLastFind = now;
+        void *found = findGameSettings(me);
+        if (!found) { g_vmMsg = @"viewmodel: GameSettings not found, retrying every 3s (see log)"; return; }
+        g_gsH = il2_gc_new(found, 0);
+        gs = found; g_vmSaved = false; g_offCvm = -1;
+        NSMutableString *e = [NSMutableString string];
+        dumpEnumField(gs, "HandsPositionType", e); dumpEnumField(gs, "FieldOfViewType", e);
+        g_vmEnums = e; NSLog(@"[SCESP] viewmodel enums:\n%@", e);
+    }
+    if (g_offCvm < 0) {                                              // resolve field offsets once per found object
+        g_offCvm   = fieldOffByName(k_gs, "CustomViewModel");   if (g_offCvm   < 0) g_offCvm = 0x20;
+        g_offHands = fieldOffByName(k_gs, "HandsPositionType"); if (g_offHands < 0) g_offHands = 0x2C;
+        g_offFovT  = fieldOffByName(k_gs, "FieldOfViewType");   if (g_offFovT  < 0) g_offFovT = 0x1C;
+    }
+    void *cvm = *(void **)((char *)gs + g_offCvm);
+    if (!plausibleObj(cvm)) { g_vmMsg = @"viewmodel: CustomViewModel is null in this settings object"; return; }
+    if (!k_cvm) {
+        k_cvm = il2_obj_class(cvm);
+        g_offPos = fieldOffByName(k_cvm, "PositionOffset"); if (g_offPos < 0) g_offPos = 0x10;
+        g_offRot = fieldOffByName(k_cvm, "RotationOffset"); if (g_offRot < 0) g_offRot = 0x1C;
+        g_offFov = fieldOffByName(k_cvm, "AdditiveFov");    if (g_offFov < 0) g_offFov = 0x28;
+        NSLog(@"[SCESP] viewmodel offsets: cvm=0x%x hands=0x%x fovT=0x%x pos=0x%x rot=0x%x fov=0x%x", g_offCvm, g_offHands, g_offFovT, g_offPos, g_offRot, g_offFov);
+    }
+    float *pos = (float *)((char *)cvm + g_offPos), *rot = (float *)((char *)cvm + g_offRot);
+    if (!g_vmSaved) {
+        for (int i = 0; i < 3; i++) { g_vmOrig[i] = pos[i]; g_vmOrig[3 + i] = rot[i]; }
+        g_vmOrig[6] = *(float *)((char *)cvm + g_offFov);
+        g_vmOrigHands = *(int *)((char *)gs + g_offHands); g_vmOrigFovT = *(int *)((char *)gs + g_offFovT);
+        g_vmSaved = true;
+    }
+    bool newMe = me && me != g_vmLastMe;
+    bool due = g_vmForce || newMe || (++g_vmTick % 90) == 0;
+    if (!due) return;
+    g_vmForce = false;
+    if (want) {
+        for (int i = 0; i < 3; i++) { pos[i] = g_set.vmv[i]; rot[i] = g_set.vmv[3 + i]; }
+        *(float *)((char *)cvm + g_offFov) = g_set.vmv[6];
+        int hands = (int)lroundf(g_set.vmv[7]), fovT = (int)lroundf(g_set.vmv[8]);
+        if (hands >= 0) *(int *)((char *)gs + g_offHands) = hands; else *(int *)((char *)gs + g_offHands) = g_vmOrigHands;
+        if (fovT >= 0)  *(int *)((char *)gs + g_offFovT) = fovT;   else *(int *)((char *)gs + g_offFovT) = g_vmOrigFovT;
+        g_vmWasOn = true;
+        g_vmMsg = [NSString stringWithFormat:@"viewmodel: ON  gs=%p obu=%s\n%@", gs, mi_obu ? "ok" : "missing", g_vmEnums];
+    } else {
+        vmRestore(gs, cvm);
+        g_vmWasOn = false;
+        g_vmMsg = @"viewmodel: off (originals restored)";
+    }
+    if (me) {
+        g_vmLastMe = me;
+        if (mi_obu) { void *args[1] = { gs }; inv(mi_obu, me, args); }
+        if (mi_betr && k_fpscam && mi_find) {
+            std::vector<void *> cams; findObjs(k_fpscam, cams, 4);
+            for (void *c : cams) { void *args[1] = { gs }; inv(mi_betr, c, args); }
+        }
+    }
+}
+
+// ---- stretched resolution ----------------------------------------------------------------------------------------
+static void *mi_setres = nullptr;
+static bool g_stTried = false, g_stOn = false;
+static int g_natW = 0, g_natH = 0, g_stTries = 0;
+static double g_stLast = 0;
+static NSString *g_stMsg = @"stretch: off";
+static void applyStretch(int sw, int sh) {
+    if (!g_set.stretch && !g_stOn) return;
+    if (!g_stTried) {
+        g_stTried = true;
+        void *core = findImage("UnityEngine.CoreModule.dll");
+        void *cScreen = core ? il2_class_from_name(core, "UnityEngine", "Screen") : nullptr;
+        void *it = nullptr, *m;
+        while (cScreen && (m = il2_class_methods(cScreen, &it))) {   // SetResolution(int,int,bool); the FullScreenMode overload is skipped
+            if (strcmp(il2_method_name(m), "SetResolution") != 0 || il2_method_pcount(m) != 3) continue;
+            const char *t2 = il2_type_name(il2_method_param(m, 2));
+            if (t2 && strcmp(t2, "System.Boolean") == 0) { mi_setres = m; break; }
+        }
+        NSLog(@"[SCESP] stretch: Screen.SetResolution(int,int,bool) = %p", mi_setres);
+    }
+    if (!mi_setres) { g_stMsg = @"stretch: Screen.SetResolution not found"; return; }
+    if (!g_stOn) { g_natW = sw; g_natH = sh; }                         // remember the native size before the first change
+    if (g_natW <= 0 || g_natH <= 0) return;
+    int tw = g_natW, th = g_natH;
+    if (g_set.stretch) {
+        tw = (int)lroundf(th * g_set.stretchAspect);
+        if (tw > g_natW) tw = g_natW;
+        if (tw < 320) tw = 320;
+    }
+    double now = CACurrentMediaTime();
+    if ((sw != tw || sh != th) && now - g_stLast > 0.5 && g_stTries < 6) {
+        g_stLast = now; g_stTries++;
+        bool fs = true;
+        void *args[3] = { &tw, &th, &fs };
+        inv(mi_setres, nullptr, args);
+        NSLog(@"[SCESP] stretch: SetResolution(%d,%d) from %dx%d (try %d)", tw, th, sw, sh, g_stTries);
+    }
+    if (sw == tw && sh == th) g_stTries = 0;
+    g_stOn = g_set.stretch || !(sw == g_natW && sh == g_natH);
+    if (!g_set.stretch && sw == g_natW && sh == g_natH) g_stOn = false;
+    g_stMsg = g_set.stretch
+        ? [NSString stringWithFormat:@"stretch: %dx%d (native %dx%d)%@", sw, sh, g_natW, g_natH, g_stTries >= 6 ? @"\ndevice/game keeps overriding it" : @""]
+        : @"stretch: off";
 }
 
 static void rescan(bool wantBones) {
@@ -1985,6 +2301,8 @@ static SCNNode *buildAgentModel() {
     UILabel *_status;
     UILabel *_lwLabel, *_hdLabel, *_fovLabel, *_spdLabel, *_aimInfo, *_tabTitle;
     UILabel *_bhStepLabel, *_bhMaxLabel, *_bhRstLabel, *_bhopInfo;
+    NSMutableArray *_vmLabels;
+    UILabel *_vmInfo, *_stInfo, *_stAspLabel;
     CAShapeLayer *_fovRing;
     NSMutableArray *_pages, *_tabs, *_swatches, *_dmgLabels;
     NLColorPicker *_picker;
@@ -2217,7 +2535,25 @@ static SCNNode *buildAgentModel() {
         _bhRstLabel  = nlSlider(mv, @"Reset time", 23, 0.1, 4, g_set.bhopReset, self, @selector(slChanged:));
         _bhopInfo = nlInfo(mv, 34, 8);
         nlEnd(mv);
-        NLCard st = nlCard(pg, @"Status", 0, fmax(nlMaxY(a.v.frame), nlMaxY(mv.v.frame)) + 8, PW);
+        // --- Viewmodel (custom hands) ---
+        NLCard vm = nlCard(pg, @"Viewmodel", 0, nlMaxY(a.v.frame) + 8, CW);
+        nlToggle(vm, @"Custom hands", 25, g_set.vm, self, @selector(swChanged:));
+        _vmLabels = [NSMutableArray array];
+        static const struct { const char *t; float mn, mx; } kVm[9] = {
+            { "Pos X", -0.5f, 0.5f }, { "Pos Y", -0.5f, 0.5f }, { "Pos Z", -0.5f, 0.5f },
+            { "Rot X", -45, 45 }, { "Rot Y", -45, 45 }, { "Rot Z", -45, 45 },
+            { "Extra FOV", -20, 40 }, { "Hands type", -1, 6 }, { "FOV type", -1, 6 } };
+        for (int i = 0; i < 9; i++)
+            [_vmLabels addObject:nlSlider(vm, [NSString stringWithUTF8String:kVm[i].t], 30 + i, kVm[i].mn, kVm[i].mx, g_set.vmv[i], self, @selector(slChanged:))];
+        _vmInfo = nlInfo(vm, 64, 8);
+        nlEnd(vm);
+        // --- Stretch ---
+        NLCard sr = nlCard(pg, @"Stretch", CW + 8, nlMaxY(mv.v.frame) + 8, CW);
+        nlToggle(sr, @"Stretched res", 26, g_set.stretch, self, @selector(swChanged:));
+        _stAspLabel = nlSlider(sr, @"Aspect (w/h)", 39, 1.0, 2.2, g_set.stretchAspect, self, @selector(slChanged:));
+        _stInfo = nlInfo(sr, 34, 8);
+        nlEnd(sr);
+        NLCard st = nlCard(pg, @"Status", 0, fmax(fmax(nlMaxY(vm.v.frame), nlMaxY(sr.v.frame)), fmax(nlMaxY(a.v.frame), nlMaxY(mv.v.frame))) + 8, PW);
         _status = nlInfo(st, 84, 8.5);
         _status.textColor = nlRGB(150, 165, 190);
         nlEnd(st);
@@ -2329,6 +2665,15 @@ static SCNNode *buildAgentModel() {
     _bhStepLabel.text = [NSString stringWithFormat:@"x%.2f", g_set.bhopStep];
     _bhMaxLabel.text  = [NSString stringWithFormat:@"x%.2f", g_set.bhopMax];
     _bhRstLabel.text  = [NSString stringWithFormat:@"x%.2f", g_set.bhopReset];
+    for (int i = 0; i < 9 && i < (int)_vmLabels.count; i++) {
+        float v = g_set.vmv[i];
+        NSString *t = i < 3 ? [NSString stringWithFormat:@"%.3f", v]
+                    : i < 6 ? [NSString stringWithFormat:@"%.0f\u00B0", v]
+                    : i == 6 ? [NSString stringWithFormat:@"%+.0f\u00B0", v]
+                    : (lroundf(v) < 0 ? @"keep" : [NSString stringWithFormat:@"%ld", lroundf(v)]);
+        ((UILabel *)_vmLabels[i]).text = t;
+    }
+    _stAspLabel.text = [NSString stringWithFormat:@"%.2f", g_set.stretchAspect];
 }
 
 - (void)swChanged:(NLToggle *)s {
@@ -2351,12 +2696,14 @@ static SCNNode *buildAgentModel() {
         case 24: g_set.wep = s.on; break;
         case 19: g_set.bhop = s.on; g_bhopForce = true; g_bhopParamsDirty = true; break;
         case 20: g_set.bhopCustom = s.on; g_bhopParamsDirty = true; break;
+        case 25: g_set.vm = s.on; g_vmForce = true; break;
+        case 26: g_set.stretch = s.on; g_stTries = 0; break;
     }
     g_dirty = true; saveSettings();
 }
 - (void)segChanged:(UISegmentedControl *)s { g_set.color = (int)s.selectedSegmentIndex; g_dirty = true; saveSettings(); }
 - (void)slChanged:(UISlider *)s {
-    if (s.tag == 10) g_set.lw = s.value; else if (s.tag == 13) g_set.fov = s.value; else if (s.tag == 14) g_set.aimSpeed = s.value; else if (s.tag == 21) g_set.bhopStep = s.value; else if (s.tag == 22) g_set.bhopMax = s.value; else if (s.tag == 23) g_set.bhopReset = s.value; else g_set.head = s.value;
+    if (s.tag == 10) g_set.lw = s.value; else if (s.tag == 13) g_set.fov = s.value; else if (s.tag == 14) g_set.aimSpeed = s.value; else if (s.tag == 21) g_set.bhopStep = s.value; else if (s.tag == 22) g_set.bhopMax = s.value; else if (s.tag == 23) g_set.bhopReset = s.value; else if (s.tag >= 30 && s.tag <= 38) { g_set.vmv[s.tag - 30] = s.value; g_vmForce = true; } else if (s.tag == 39) { g_set.stretchAspect = s.value; g_stTries = 0; } else g_set.head = s.value;
     [self refreshLabels]; saveSettings();
 }
 static BOOL g_panelClosing = NO;
@@ -2524,6 +2871,8 @@ static BOOL g_panelClosing = NO;
                 std::vector<AimTg> tg; void *meObj = nullptr; int nBots = 0;
                 for (auto &p : ps) if (p.self) meObj = p.obj;
                 applyBhop(meObj, g_set.bhop);
+                applyViewmodel(meObj);
+                applyStretch(sw, sh);
                 std::vector<CGPoint> sp; std::vector<char> okp;
                 for (auto &p : ps) {
                     if (p.self) continue;
@@ -2873,6 +3222,8 @@ static BOOL g_panelClosing = NO;
 
     if (!_panel.hidden) {
         _bhopInfo.text = g_bhopMsg;
+        _vmInfo.text = g_vmMsg;
+        _stInfo.text = g_stMsg;
         NSMutableString *cs = [NSMutableString string];
         for (int i = 0; i < kN; i++) [cs appendFormat:@"%s%zu", i ? "/" : "", g_counts[i]];
         NSString *sh = g_chamShaderUsed ? [NSString stringWithUTF8String:g_chamShaderUsed] : (g_chamFailed ? @"no shader" : @"-");
