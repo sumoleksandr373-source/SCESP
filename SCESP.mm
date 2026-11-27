@@ -1,4 +1,4 @@
-// SCESP.mm v5.8 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
+// SCESP.mm v5.9 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
 //
 // Box / skeleton / chams / box fill / health bar, enemies only (teammates optional), settings panel.
 // Tap the small "ESP" plate (top-left) to open/close the settings panel.
@@ -25,6 +25,11 @@
 //   prints the enum members it can read, so you can see which number is which.
 // - stretch (v5.8, Misc > Stretch): Screen.SetResolution(height*aspect, height). iOS scales the smaller backbuffer to the whole screen.
 //   The ESP overlay keeps lining up because it maps world->screen with the current Screen.width/height every tick.
+// - no spread (v5.9, Misc > Performance): zeroes the weapon accuracy/dispersion data of every live GunParameters (names taken from the static
+//   metadata dump): _accuracyMultOnJump/_accuracyMultOnCrouch/_accuracyAimMult/_accuracyAimMultOnCrouch (floats) and the curves
+//   _accuracyAdditiveCurve, _additiveNoAimDispertionCurve, _recoilParameters.relativeDispertionCurve (swapped for AnimationCurve.Constant(0,1,0)).
+//   Originals are saved and put back when the toggle goes off. It only runs while every other character in the scene is a bot
+//   (offline bot match); the moment a non-bot character shows up everything is restored.
 // - hot path uses direct method-pointer calls; drawing is 30 fps, scan about once a second
 //
 // Not compiled or run on a device by me. If something misbehaves, the panel's status line says where.
@@ -101,6 +106,7 @@ struct Settings {
     bool wep = true;        // weapon name under the box
     bool vm = false;        // custom hands position (game's CustomViewModel)
     float vmv[9] = { 0, 0, 0, 0, 0, 0, 0, -1, -1 };   // posX posY posZ rotX rotY rotZ addFov handsType(-1=keep) fovType(-1=keep)
+    bool nospread = false;  // zero weapon spread/dispersion data (offline bot matches only)
     bool stretch = false;   // stretched resolution
     float stretchAspect = 1.3333f;                      // width/height of the render target
 };
@@ -128,6 +134,7 @@ static void saveSettings() {
     [d setBool:g_set.noocc forKey:@"scesp_noocc"];
     [d setBool:g_set.hp forKey:@"scesp_hp"];
     [d setBool:g_set.hdot forKey:@"scesp_hdot"];
+    [d setBool:g_set.nospread forKey:@"scesp_nsp"];
     [d setBool:g_set.bhop forKey:@"scesp_bhop"];
     [d setBool:g_set.bhopCustom forKey:@"scesp_bhcus"];
     [d setFloat:g_set.bhopStep forKey:@"scesp_bhstep"]; [d setFloat:g_set.bhopMax forKey:@"scesp_bhmax"]; [d setFloat:g_set.bhopReset forKey:@"scesp_bhrst"];
@@ -156,6 +163,7 @@ static void loadSettings() {
     g_set.lowcpu = [d boolForKey:@"scesp_low"];
     g_set.noocc = [d objectForKey:@"scesp_noocc"] ? [d boolForKey:@"scesp_noocc"] : true;
     g_set.hdot = [d objectForKey:@"scesp_hdot"] ? [d boolForKey:@"scesp_hdot"] : true;
+    g_set.nospread = [d boolForKey:@"scesp_nsp"];
     g_set.bhop = [d boolForKey:@"scesp_bhop"];
     g_set.bhopCustom = [d boolForKey:@"scesp_bhcus"];
     g_set.bhopStep = [d floatForKey:@"scesp_bhstep"];   if (g_set.bhopStep  < 0.1f) g_set.bhopStep  = 1.0f;
@@ -1279,6 +1287,159 @@ static void applyViewmodel(void *me) {
             for (void *c : cams) { void *args[1] = { gs }; inv(mi_betr, c, args); }
         }
     }
+}
+
+// ---- no spread (v5.9) --------------------------------------------------------------------------------------------
+// Static metadata dump (global-metadata.dat, v31), Chillow.StandChillow.Inventory.Gun:
+//   GunParameters { _accuracyAdditiveCurve, _accuracyMultOnJump, _additiveNoAimDispertionCurve, _accuracyMultOnCrouch,
+//                   _accuracyAimMult, _accuracyAimMultOnCrouch, _recoilParameters, ... }
+//   RecoilParameters { horizontalRange, verticalRange, xAxisDeviation, yAxisDeviation, ..., relativeDispertionCurve, ... }
+// Everything is looked up by NAME and TYPE at runtime (no offsets). Recoil kick itself is not touched here (that is _recoilControl /
+// xAxisDeviation / yAxisDeviation, a separate feature); this only flattens the accuracy cone.
+// Gate (computed by the caller each tick): at least one other character and ALL of them are bots = offline bot match.
+// Not run on a device by me. If the status line says "0 slots", send me the [SCESP] nospread log lines.
+struct NsSlot { uint32_t owner; int off; uint8_t kind; uint32_t hOrig; float origF; };   // kind 0 = float, 1 = AnimationCurve
+static std::vector<NsSlot> g_nsSlots;
+static std::unordered_set<void *> g_nsSeen;
+static void *k_nsGP, *k_nsAC, *mi_nsConst;
+static uint32_t g_nsZero = 0;                // gchandle of the shared flat AnimationCurve
+static bool g_nsTried = false, g_nsActive = false;
+static double g_nsLastScan = 0;
+static int g_nsObs = 0, g_nsParams = 0;
+static NSString *g_nsMsg = @"no spread: off";
+
+static void nsInit() {
+    if (g_nsTried) return;
+    g_nsTried = true;
+    loadVmApi();                                                   // object_get_class etc.
+    void *game = gameImage(), *core = findImage("UnityEngine.CoreModule.dll");
+    if (game) k_nsGP = il2_class_from_name(game, "Chillow.StandChillow.Inventory.Gun", "GunParameters");
+    if (core) k_nsAC = il2_class_from_name(core, "UnityEngine", "AnimationCurve");
+    if (k_nsAC) mi_nsConst = il2_get_method(k_nsAC, "Constant", 3);
+    NSLog(@"[SCESP] nospread: GunParameters=%p AnimationCurve=%p Constant=%p", k_nsGP, k_nsAC, mi_nsConst);
+}
+static void *nsFlatCurve() {
+    void *c = g_nsZero ? il2_gc_get(g_nsZero) : nullptr;
+    if (c) return c;
+    if (!mi_nsConst) return nullptr;
+    float a = 0.f, b = 1.f, v = 0.f;
+    void *args[3] = { &a, &b, &v };
+    c = inv(mi_nsConst, nullptr, args);
+    if (c) g_nsZero = il2_gc_new(c, 0);
+    return c;
+}
+// GunParameters is a plain class on some builds and a ScriptableObject on others: try the Unity object search first,
+// then walk the reference fields of every GunController (two hops) and keep whatever has exactly the GunParameters class.
+static void nsWalkRefs(void *obj, int depth, std::vector<void *> &out, std::unordered_set<void *> &vis) {
+    if (!obj || depth < 0 || !il2_obj_class || !vis.insert(obj).second) return;
+    for (void *k = il2_obj_class(obj); k; k = il2_class_parent(k)) {
+        void *it = nullptr, *f;
+        while ((f = il2_class_fields(k, &it))) {
+            if (il2_field_flags(f) & 0x10) continue;
+            void *ft = il2_field_type(f);
+            const char *tn = ft ? il2_type_name(ft) : nullptr;
+            if (!tn || strncmp(tn, "Chillow.StandChillow.", 21) != 0) continue;
+            void *fk = il2_class_from_type(ft);
+            if (!fk || (il2_class_is_vt && il2_class_is_vt(fk))) continue;
+            void *p = *(void **)((char *)obj + il2_field_offset(f));
+            if (!plausibleObj(p)) continue;
+            if (il2_obj_class(p) == k_nsGP) { if (vis.insert(p).second) out.push_back(p); }
+            else nsWalkRefs(p, depth - 1, out, vis);
+        }
+    }
+}
+static void nsFindParams(std::vector<void *> &out) {
+    std::vector<void *> v;
+    if (mi_find && k_nsGP) findObjs(k_nsGP, v, 512);
+    for (void *o : v) out.push_back(o);
+    if (!out.empty() || !mi_find) return;
+    void *game = gameImage();
+    void *kgc = game ? il2_class_from_name(game, "Chillow.StandChillow.Inventory.Gun", "GunController") : nullptr;
+    if (!kgc) return;
+    std::vector<void *> gcs; findObjs(kgc, gcs, 256);
+    std::unordered_set<void *> vis;
+    for (void *g : gcs) nsWalkRefs(g, 2, out, vis);
+}
+static void nsAddSlot(void *owner, int off, uint8_t kind) {
+    NsSlot s{}; s.owner = il2_gc_new(owner, 0); s.off = off; s.kind = kind;
+    char *a = (char *)owner + off;
+    if (kind == 0) s.origF = *(float *)a;
+    else { void *c = *(void **)a; s.hOrig = c ? il2_gc_new(c, 0) : 0; }
+    g_nsSlots.push_back(s);
+}
+static void nsScanOne(void *gp) {
+    static const char *kF[] = { "_accuracyMultOnJump", "_accuracyMultOnCrouch", "_accuracyAimMult", "_accuracyAimMultOnCrouch" };
+    static const char *kC[] = { "_accuracyAdditiveCurve", "_additiveNoAimDispertionCurve" };
+    for (void *k = il2_obj_class(gp); k; k = il2_class_parent(k)) {
+        void *it = nullptr, *f;
+        while ((f = il2_class_fields(k, &it))) {
+            if (il2_field_flags(f) & 0x10) continue;
+            const char *fn = il2_field_name(f);
+            void *ft = il2_field_type(f);
+            const char *tn = ft ? il2_type_name(ft) : nullptr;
+            if (!fn || !tn) continue;
+            int off = il2_field_offset(f);
+            for (const char *n : kF) if (!strcmp(fn, n)) {
+                if (!strcmp(tn, "System.Single")) nsAddSlot(gp, off, 0);
+                else { g_nsObs++; NSLog(@"[SCESP] nospread: %s is %s (not a plain float), skipped", fn, tn); }
+            }
+            for (const char *n : kC) if (!strcmp(fn, n)) {
+                if (!strcmp(tn, "UnityEngine.AnimationCurve")) nsAddSlot(gp, off, 1);
+                else NSLog(@"[SCESP] nospread: %s is %s (not an AnimationCurve), skipped", fn, tn);
+            }
+            if (!strcmp(fn, "_recoilParameters")) {
+                void *rk = il2_class_from_type(ft);
+                int co = rk ? fieldOffByName(rk, "relativeDispertionCurve") : -1;
+                if (co < 0) continue;
+                if (il2_class_is_vt && il2_class_is_vt(rk)) nsAddSlot(gp, off + co - 16, 1);          // inline struct: its field offsets include the 0x10 box header
+                else { void *rp = *(void **)((char *)gp + off); if (plausibleObj(rp)) nsAddSlot(rp, co, 1); }
+            }
+        }
+    }
+}
+static void nsRestore() {
+    for (auto &s : g_nsSlots) {
+        char *o = (char *)il2_gc_get(s.owner);
+        if (o) {
+            if (s.kind == 0) *(float *)(o + s.off) = s.origF;
+            else { void *c = s.hOrig ? il2_gc_get(s.hOrig) : nullptr; if (c) *(void **)(o + s.off) = c; }
+        }
+        il2_gc_free(s.owner);
+        if (s.hOrig) il2_gc_free(s.hOrig);
+    }
+    g_nsSlots.clear(); g_nsSeen.clear(); g_nsParams = 0; g_nsObs = 0;
+}
+static void nsAssert() {
+    void *flat = nullptr;
+    for (auto &s : g_nsSlots) {
+        char *o = (char *)il2_gc_get(s.owner);
+        if (!o) continue;
+        if (s.kind == 0) { float *p = (float *)(o + s.off); if (*p != 0.f) *p = 0.f; }
+        else { if (!flat) flat = nsFlatCurve(); if (flat) *(void **)(o + s.off) = flat; }
+    }
+}
+// me = local PlayerController (or null), want = toggle, offline = every other character is a bot
+static void applyNoSpread(void *me, bool want, bool offline) {
+    bool active = want && offline && me;
+    if (!active) {
+        if (g_nsActive) { nsRestore(); g_nsActive = false; NSLog(@"[SCESP] nospread: restored"); }
+        g_nsMsg = !want ? @"no spread: off" : @"no spread: waiting (offline match with bots only)";
+        return;
+    }
+    nsInit();
+    if (!k_nsGP || !il2_obj_class) { g_nsMsg = @"no spread: GunParameters class not found"; return; }
+    double now = CACurrentMediaTime();
+    if (!g_nsActive || now - g_nsLastScan > 2.0) {                   // weapons load lazily, so look again every 2 s
+        g_nsLastScan = now;
+        std::vector<void *> gps; nsFindParams(gps);
+        size_t before = g_nsSlots.size();
+        for (void *gp : gps) if (g_nsSeen.insert(gp).second) { g_nsParams++; nsScanOne(gp); }
+        if (g_nsSlots.size() != before) NSLog(@"[SCESP] nospread: %d GunParameters, %zu slots", g_nsParams, g_nsSlots.size());
+        g_nsActive = true;
+    }
+    if (g_nsSlots.empty()) { g_nsMsg = [NSString stringWithFormat:@"no spread: 0 slots (%d params, %d obscured), retrying", g_nsParams, g_nsObs]; return; }
+    nsAssert();                                                      // every tick: the game may re-apply its own values (cheap: writes only on change)
+    g_nsMsg = [NSString stringWithFormat:@"no spread: ON  %d params, %zu fields%s", g_nsParams, g_nsSlots.size(), g_nsObs ? " (some obscured, skipped)" : ""];
 }
 
 // ---- stretched resolution ----------------------------------------------------------------------------------------
@@ -2526,6 +2687,7 @@ static SCNNode *buildAgentModel() {
         NLCard a = nlCard(pg, @"Performance", 0, 0, CW);
         nlToggle(a, @"Low CPU", 6, g_set.lowcpu, self, @selector(swChanged:));
         nlToggle(a, @"No occlusion", 7, g_set.noocc, self, @selector(swChanged:));
+        nlToggle(a, @"No spread (bots)", 40, g_set.nospread, self, @selector(swChanged:));
         nlEnd(a);
         NLCard mv = nlCard(pg, @"Movement", CW + 8, 0, CW);
         nlToggle(mv, @"Bunny hop", 19, g_set.bhop, self, @selector(swChanged:));
@@ -2698,6 +2860,7 @@ static SCNNode *buildAgentModel() {
         case 20: g_set.bhopCustom = s.on; g_bhopParamsDirty = true; break;
         case 25: g_set.vm = s.on; g_vmForce = true; break;
         case 26: g_set.stretch = s.on; g_stTries = 0; break;
+        case 40: g_set.nospread = s.on; break;
     }
     g_dirty = true; saveSettings();
 }
@@ -2870,6 +3033,11 @@ static BOOL g_panelClosing = NO;
 
                 std::vector<AimTg> tg; void *meObj = nullptr; int nBots = 0;
                 for (auto &p : ps) if (p.self) meObj = p.obj;
+                {   // offline bot match = at least one other character and every other character is a bot
+                    int others = 0; bool allBots = true;
+                    for (auto &p : ps) { if (p.self) continue; others++; if (!isBotObj(p.obj)) allBots = false; }
+                    applyNoSpread(meObj, g_set.nospread, others > 0 && allBots);
+                }
                 applyBhop(meObj, g_set.bhop);
                 applyViewmodel(meObj);
                 applyStretch(sw, sh);
@@ -3224,6 +3392,7 @@ static BOOL g_panelClosing = NO;
         _bhopInfo.text = g_bhopMsg;
         _vmInfo.text = g_vmMsg;
         _stInfo.text = g_stMsg;
+        _vmInfo.text = [g_vmMsg stringByAppendingFormat:@"\n%@", g_nsMsg];
         NSMutableString *cs = [NSMutableString string];
         for (int i = 0; i < kN; i++) [cs appendFormat:@"%s%zu", i ? "/" : "", g_counts[i]];
         NSString *sh = g_chamShaderUsed ? [NSString stringWithUTF8String:g_chamShaderUsed] : (g_chamFailed ? @"no shader" : @"-");
