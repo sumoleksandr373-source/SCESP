@@ -47,6 +47,8 @@
 #include <string>
 #include <algorithm>
 #include <math.h>
+#include <stdio.h>
+#include <unistd.h>
 #include "dobby.h"
 // ---- SilentAimCore (inlined, no separate header needed) ----
 
@@ -299,6 +301,26 @@ struct Settings {
 static Settings g_set;
 static bool g_hookCrashed = false;        // previous launch died after the silent hook was installed -> silent is switched off
 static double g_hookInstallT = 0;
+// Breadcrumbs written + fsync'ed immediately, so they survive a crash. The previous run's tail is shown on the Silent aim card.
+static NSString *g_prevTrace = @"";
+static FILE *g_traceF = nullptr;
+static NSString *tracePath() { return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"SCESP_trace.txt"]; }
+static void traceInit() {
+    if (g_traceF) return;
+    NSString *p = tracePath();
+    NSString *old = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+    if (old.length) {
+        NSArray *ln = [old componentsSeparatedByString:@"\n"]; NSMutableArray *tail = [NSMutableArray array];
+        for (NSInteger i = (NSInteger)ln.count - 1; i >= 0 && tail.count < 5; i--) if ([ln[i] length]) [tail insertObject:ln[i] atIndex:0];
+        g_prevTrace = [tail componentsJoinedByString:@"\n"];
+    }
+    g_traceF = fopen(p.fileSystemRepresentation, "w");
+}
+static void trace(NSString *msg) {
+    if (!g_traceF) traceInit();
+    if (!g_traceF) return;
+    fputs([msg UTF8String], g_traceF); fputc('\n', g_traceF); fflush(g_traceF); fsync(fileno(g_traceF));
+}
 static bool g_dirty = true;
 
 static UIColor *colorFor(int i, CGFloat a) {
@@ -380,6 +402,7 @@ static void loadSettings() {
     if (g_selectedAimPart < 0 || g_selectedAimPart >= kAimPartCount) g_selectedAimPart = kAimHead;
     g_set.vm = [d boolForKey:@"scesp_vm"];
     g_set.silent = [d boolForKey:@"scesp_silent"];
+    traceInit();
     if ([d boolForKey:@"scesp_hookpending"]) {      // the last run installed the hook and never reached the "stable" mark
         g_hookCrashed = true; g_set.silent = false;
         [d setBool:NO forKey:@"scesp_hookpending"]; [d setBool:NO forKey:@"scesp_silent"]; [d synchronize];
@@ -1171,6 +1194,7 @@ static inline float v3len(V3 v) { return sqrtf(v.x * v.x + v.y * v.y + v.z * v.z
 static inline float v3dist(V3 a, silent_aim::Vec3 b) { float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z; return sqrtf(dx * dx + dy * dy + dz * dz); }
 static void *hook_xqp(void *self, int idx, V3 a, V3 b, void *mi) {
     @try {
+        if (g_hookLog < 12) { trace([NSString stringWithFormat:@"hook call %d offline=%d targets=%zu", g_hookLog, (int)g_silentOffline, g_silentTargets.size()]); }
         if (g_hookLog < 12) {     // first shots: print the arguments so the origin/direction guess can be checked
             g_hookLog++;
             NSLog(@"[SCESP] xqp idx=%d a=(%.2f %.2f %.2f) |a|=%.2f b=(%.2f %.2f %.2f) |b|=%.2f cam=(%.2f %.2f %.2f)",
@@ -1200,9 +1224,21 @@ static void installSilentHook() {
         if (mn && !strcmp(mn, "xqp") && il2_method_pcount(m) == 3) { target = direct(m); break; }
     }
     if (!target) { g_silentHookMsg = @"silent hook: xqp not found (names change per build, re-run Dump shot methods)"; return; }
+    {   // refuse to patch anything that is not exactly (this, int, Vector3, Vector3) -> reference type
+        typedef bool (*f_inst)(void *); typedef void *(*f_ret)(void *);
+        f_inst isInst = (f_inst)dlsym(RTLD_DEFAULT, "il2cpp_method_is_instance");
+        f_ret mRet = (f_ret)dlsym(RTLD_DEFAULT, "il2cpp_method_get_return_type");
+        const char *p0 = il2_type_name(il2_method_param(m, 0)), *p1 = il2_type_name(il2_method_param(m, 1)), *p2 = il2_type_name(il2_method_param(m, 2));
+        const char *rt = mRet ? il2_type_name(mRet(m)) : nullptr;
+        bool okSig = isInst && isInst(m) && p0 && p1 && p2 && !strcmp(p0, "System.Int32") && !strcmp(p1, "UnityEngine.Vector3") && !strcmp(p2, "UnityEngine.Vector3") && rt && strcmp(rt, "System.Void");
+        trace([NSString stringWithFormat:@"sig check inst=%d p0=%s p1=%s p2=%s ret=%s -> %d", isInst ? (int)isInst(m) : -1, p0 ? p0 : "?", p1 ? p1 : "?", p2 ? p2 : "?", rt ? rt : "?", okSig]);
+        if (!okSig) { g_silentHookMsg = @"silent hook: xqp signature is not (this,int,Vector3,Vector3), refusing to patch"; return; }
+    }
+    trace([NSString stringWithFormat:@"install begin target=%p", target]);
     { NSUserDefaults *ud = NSUserDefaults.standardUserDefaults; [ud setBool:YES forKey:@"scesp_hookpending"]; [ud synchronize]; }
     g_hookInstallT = CACurrentMediaTime();
     int r = DobbyHook(target, (void *)hook_xqp, (void **)&orig_xqp);
+    trace([NSString stringWithFormat:@"install done r=%d orig=%p", r, (void *)orig_xqp]);
     g_silentHookOk = (r == 0 && orig_xqp);
     if (!g_silentHookOk) { g_hookInstallT = 0; [NSUserDefaults.standardUserDefaults setBool:NO forKey:@"scesp_hookpending"]; }
     g_silentHookMsg = g_silentHookOk ? @"silent hook: installed on GunController.xqp" : [NSString stringWithFormat:@"silent hook: DobbyHook failed (%d)", r];
@@ -2921,7 +2957,7 @@ static SCNNode *buildAgentModel() {
         NLCard sc = nlCard(pg, @"Silent aim", 0, silY, PW);
         nlToggle(sc, @"Enabled (bots only)", 41, g_set.silent, self, @selector(swChanged:));
         _silFovLabel = nlSlider(sc, @"Silent FOV", 42, 1, 45, g_set.silentFov, self, @selector(slChanged:));
-        _silInfo = nlInfo(sc, 52, 9);
+        _silInfo = nlInfo(sc, 96, 9);
         nlEnd(sc);
         CGFloat previewY = nlMaxY(sc.v.frame) + 8;
         NLCard preview = nlCard(pg, @"T-SIDE / TARGET POINT", 0, previewY, PW);
@@ -3799,6 +3835,7 @@ static BOOL g_panelClosing = NO;
             _aimInfo.text = l3;
             _silInfo.text = [NSString stringWithFormat:@"%@\n%@ | targets %zu\nshots seen %d, redirected %d", g_hookCrashed ? @"silent: switched off, last run crashed after hook install (toggle to retry)" : g_silentHookMsg,
                              g_silentOffline ? @"bots-only match: OK" : @"waiting: needs a match with only bots", g_silentTargets.size(), g_silSeen, g_silApplied];
+            if (g_prevTrace.length) _silInfo.text = [_silInfo.text stringByAppendingFormat:@"\nlast run trace:\n%@", g_prevTrace];
         } @catch (...) {}
     }
 }
