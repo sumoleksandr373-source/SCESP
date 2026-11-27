@@ -1158,7 +1158,7 @@ static bool silentAimApply(V3 shotOriginIn, V3 &directionInOut, bool aimKeyDown)
 // the direction is the (near) unit-length one, the origin is the one next to the camera. Bots' own guns go through
 // the same method; their origin is far from my camera, so they are left alone.
 static void *(*orig_xqp)(void *, int, V3, V3, void *) = nullptr;
-static int g_hookLog = 0;
+static int g_hookLog = 0, g_silSeen = 0, g_silApplied = 0;
 static bool g_silentHookTried = false, g_silentHookOk = false;
 static NSString *g_silentHookMsg = @"silent hook: not installed";
 static inline float v3len(V3 v) { return sqrtf(v.x * v.x + v.y * v.y + v.z * v.z); }
@@ -1170,12 +1170,13 @@ static void *hook_xqp(void *self, int idx, V3 a, V3 b, void *mi) {
             NSLog(@"[SCESP] xqp idx=%d a=(%.2f %.2f %.2f) |a|=%.2f b=(%.2f %.2f %.2f) |b|=%.2f cam=(%.2f %.2f %.2f)",
                   idx, a.x, a.y, a.z, v3len(a), b.x, b.y, b.z, v3len(b), g_silentCam.x, g_silentCam.y, g_silentCam.z);
         }
+        if (g_set.silent) g_silSeen++;
         if (g_set.silent && g_silentOffline) {
             bool bIsDir = fabsf(v3len(b) - 1.0f) < 0.02f, aIsDir = fabsf(v3len(a) - 1.0f) < 0.02f;
             if (bIsDir && !aIsDir && v3dist(a, g_silentCam) < 2.5f) {
-                V3 d = b; if (silentAimApply(a, d, true)) b = d;
+                V3 d = b; if (silentAimApply(a, d, true)) { b = d; g_silApplied++; }
             } else if (aIsDir && !bIsDir && v3dist(b, g_silentCam) < 2.5f) {
-                V3 d = a; if (silentAimApply(b, d, true)) a = d;
+                V3 d = a; if (silentAimApply(b, d, true)) { a = d; g_silApplied++; }
             }
         }
     } @catch (...) {}
@@ -2780,7 +2781,7 @@ static SCNNode *buildAgentModel() {
     UIView *_panel;
     UILabel *_status;
     UITextView *_dumpView; UIButton *_dumpClose;
-    UILabel *_lwLabel, *_hdLabel, *_fovLabel, *_spdLabel, *_aimInfo, *_tabTitle;
+    UILabel *_lwLabel, *_hdLabel, *_fovLabel, *_spdLabel, *_aimInfo, *_silFovLabel, *_silInfo, *_tabTitle;
     UILabel *_bhStepLabel, *_bhMaxLabel, *_bhRstLabel, *_bhopInfo;
     NSMutableArray *_vmLabels;
     UILabel *_vmInfo, *_stInfo, *_stAspLabel;
@@ -2895,7 +2896,6 @@ static SCNNode *buildAgentModel() {
         NLCard a = nlCard(pg, @"Aim lock", 0, 0, CW);
         nlToggle(a, @"Enabled", 8, g_set.aim, self, @selector(swChanged:));
         nlToggle(a, @"Draw FOV", 15, g_set.drawFov, self, @selector(swChanged:));
-        nlToggle(a, @"Silent aim (bots)", 41, g_set.silent, self, @selector(swChanged:));
         _fovLabel = nlSlider(a, @"FOV", 13, 5, 90, g_set.fov, self, @selector(slChanged:));
         _spdLabel = nlSlider(a, @"Speed", 14, 4, 40, g_set.aimSpeed, self, @selector(slChanged:));
         nlEnd(a);
@@ -2908,7 +2908,13 @@ static SCNNode *buildAgentModel() {
         nlEnd(b);
 
         // T-side agent preview: 3D model, tap a body part to choose the aim region, drag or use the arrows to rotate.
-        CGFloat previewY = fmax(nlMaxY(a.v.frame), nlMaxY(b.v.frame)) + 8;
+        CGFloat silY = fmax(nlMaxY(a.v.frame), nlMaxY(b.v.frame)) + 8;
+        NLCard sc = nlCard(pg, @"Silent aim", 0, silY, PW);
+        nlToggle(sc, @"Enabled (bots only)", 41, g_set.silent, self, @selector(swChanged:));
+        _silFovLabel = nlSlider(sc, @"Silent FOV", 42, 1, 45, g_set.silentFov, self, @selector(slChanged:));
+        _silInfo = nlInfo(sc, 52, 9);
+        nlEnd(sc);
+        CGFloat previewY = nlMaxY(sc.v.frame) + 8;
         NLCard preview = nlCard(pg, @"T-SIDE / TARGET POINT", 0, previewY, PW);
         const CGFloat VW = 190, VH = 250, VX = 10, VY = 28;
         _agentView = [[SCNView alloc] initWithFrame:CGRectMake(VX, VY, VW, VH)];
@@ -3147,6 +3153,7 @@ static SCNNode *buildAgentModel() {
     _hdLabel.text = [NSString stringWithFormat:@"%.2f m", g_set.head];
     _fovLabel.text = [NSString stringWithFormat:@"%.0f\u00B0", g_set.fov];
     _spdLabel.text = [NSString stringWithFormat:@"%.0f", g_set.aimSpeed];
+    _silFovLabel.text = [NSString stringWithFormat:@"%.0f\u00B0", g_set.silentFov];
     _bhStepLabel.text = [NSString stringWithFormat:@"x%.2f", g_set.bhopStep];
     _bhMaxLabel.text  = [NSString stringWithFormat:@"x%.2f", g_set.bhopMax];
     _bhRstLabel.text  = [NSString stringWithFormat:@"x%.2f", g_set.bhopReset];
@@ -3190,7 +3197,7 @@ static SCNNode *buildAgentModel() {
 }
 - (void)segChanged:(UISegmentedControl *)s { g_set.color = (int)s.selectedSegmentIndex; g_dirty = true; saveSettings(); }
 - (void)slChanged:(UISlider *)s {
-    if (s.tag == 10) g_set.lw = s.value; else if (s.tag == 13) g_set.fov = s.value; else if (s.tag == 14) g_set.aimSpeed = s.value; else if (s.tag == 21) g_set.bhopStep = s.value; else if (s.tag == 22) g_set.bhopMax = s.value; else if (s.tag == 23) g_set.bhopReset = s.value; else if (s.tag >= 30 && s.tag <= 38) { g_set.vmv[s.tag - 30] = s.value; g_vmForce = true; } else if (s.tag == 39) { g_set.stretchAspect = s.value; g_stTries = 0; } else g_set.head = s.value;
+    if (s.tag == 10) g_set.lw = s.value; else if (s.tag == 13) g_set.fov = s.value; else if (s.tag == 14) g_set.aimSpeed = s.value; else if (s.tag == 42) g_set.silentFov = s.value; else if (s.tag == 21) g_set.bhopStep = s.value; else if (s.tag == 22) g_set.bhopMax = s.value; else if (s.tag == 23) g_set.bhopReset = s.value; else if (s.tag >= 30 && s.tag <= 38) { g_set.vmv[s.tag - 30] = s.value; g_vmForce = true; } else if (s.tag == 39) { g_set.stretchAspect = s.value; g_stTries = 0; } else g_set.head = s.value;
     [self refreshLabels]; saveSettings();
 }
 static BOOL g_panelClosing = NO;
@@ -3348,8 +3355,8 @@ static BOOL g_panelClosing = NO;
     bool scanNow = false;
     void *diagR = nullptr;
 
-    if (g_set.on) {
-        if (now - _lastScan > 1.0) { rescan(g_set.skel || g_set.chams || g_set.box || g_set.aim); scanNow = true; _lastScan = now; }
+    if (g_set.on || g_set.silent) {
+        if (now - _lastScan > 1.0) { rescan(g_set.skel || g_set.chams || g_set.box || g_set.aim || g_set.silent); scanNow = true; _lastScan = now; }
         @try {
             void *cam = d_cam_main(mi_cam_main);
             int sw = d_sw(mi_sw), sh = d_sh(mi_sh);
@@ -3437,7 +3444,7 @@ static BOOL g_panelClosing = NO;
                         if (y > maxY) maxY = y;
                     }
                     float hpv = 0;
-                    bool needHp = wantHp || ((mi_hp || g_haveHp) && (g_set.dmg || g_set.aim));
+                    bool needHp = wantHp || ((mi_hp || g_haveHp) && (g_set.dmg || g_set.aim || g_set.silent));
                     bool hpOk = needHp && readHp(p.obj, &pi, hpv);
                     if (g_set.dmg && hpOk) {
                         if (g_hpPrev.size() > 128) g_hpPrev.clear();
@@ -3679,6 +3686,12 @@ static BOOL g_panelClosing = NO;
     @try { if (g_set.on && g_set.chams && !g_cbActive && !g_chams.empty() && (++_vfy % 6 == 0)) verifyChams(); } @catch (...) {}
     @try { pumpChamZTest(); } @catch (...) {}
 
+    if (!g_set.on) {        // ESP master switch off: keep silent aim running but draw nothing
+        [boxPath removeAllPoints]; [skelPath removeAllPoints]; [hpBack removeAllPoints]; [hpG removeAllPoints];
+        [hpY removeAllPoints]; [hpR removeAllPoints]; [armPath removeAllPoints]; [armFlagPath removeAllPoints];
+        [dotPath removeAllPoints]; dd.clear(); bt.clear(); wt.clear();
+        if (!g_set.aim) [fovPath removeAllPoints];
+    }
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     _boxes.frame = _overlay.bounds; _skel.frame = _overlay.bounds;
@@ -3772,6 +3785,8 @@ static BOOL g_panelClosing = NO;
                                       : diagRenderer(diagR));
             _status.text = [_status.text stringByAppendingFormat:@"\n%@\n%@", l3, mi_hp ? (mi_armor ? @"hp: ode() | armor: odf()/odg()" : @"hp: PlayerController.ode() | armor: n/a") : g_hpMsg];
             _aimInfo.text = l3;
+            _silInfo.text = [NSString stringWithFormat:@"%@\n%@ | targets %zu\nshots seen %d, redirected %d", g_silentHookMsg,
+                             g_silentOffline ? @"bots-only match: OK" : @"waiting: needs a match with only bots", g_silentTargets.size(), g_silSeen, g_silApplied];
         } @catch (...) {}
     }
 }
