@@ -47,6 +47,7 @@
 #include <string>
 #include <algorithm>
 #include <math.h>
+#include "dobby.h"
 // ---- SilentAimCore (inlined, no separate header needed) ----
 
 #include <algorithm>
@@ -1149,6 +1150,53 @@ static bool silentAimApply(V3 shotOriginIn, V3 &directionInOut, bool aimKeyDown)
         return true;
     }
     return false;
+}
+
+// ---- silent aim hook: GunController.xqp(int, Vector3, Vector3) -> cfo  (shot object factory) ----------
+// ARM64 ABI: x0 = this, w1 = int, first Vector3 in s0-s2, second in s3-s5, x2 = MethodInfo*.
+// We do not know from the dump which Vector3 is the origin and which is the direction, so the hook decides at runtime:
+// the direction is the (near) unit-length one, the origin is the one next to the camera. Bots' own guns go through
+// the same method; their origin is far from my camera, so they are left alone.
+static void *(*orig_xqp)(void *, int, V3, V3, void *) = nullptr;
+static int g_hookLog = 0;
+static bool g_silentHookTried = false, g_silentHookOk = false;
+static NSString *g_silentHookMsg = @"silent hook: not installed";
+static inline float v3len(V3 v) { return sqrtf(v.x * v.x + v.y * v.y + v.z * v.z); }
+static inline float v3dist(V3 a, silent_aim::Vec3 b) { float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z; return sqrtf(dx * dx + dy * dy + dz * dz); }
+static void *hook_xqp(void *self, int idx, V3 a, V3 b, void *mi) {
+    @try {
+        if (g_hookLog < 12) {     // first shots: print the arguments so the origin/direction guess can be checked
+            g_hookLog++;
+            NSLog(@"[SCESP] xqp idx=%d a=(%.2f %.2f %.2f) |a|=%.2f b=(%.2f %.2f %.2f) |b|=%.2f cam=(%.2f %.2f %.2f)",
+                  idx, a.x, a.y, a.z, v3len(a), b.x, b.y, b.z, v3len(b), g_silentCam.x, g_silentCam.y, g_silentCam.z);
+        }
+        if (g_set.silent && g_silentOffline) {
+            bool bIsDir = fabsf(v3len(b) - 1.0f) < 0.02f, aIsDir = fabsf(v3len(a) - 1.0f) < 0.02f;
+            if (bIsDir && !aIsDir && v3dist(a, g_silentCam) < 2.5f) {
+                V3 d = b; if (silentAimApply(a, d, true)) b = d;
+            } else if (aIsDir && !bIsDir && v3dist(b, g_silentCam) < 2.5f) {
+                V3 d = a; if (silentAimApply(b, d, true)) a = d;
+            }
+        }
+    } @catch (...) {}
+    return orig_xqp(self, idx, a, b, mi);
+}
+static void installSilentHook() {
+    if (g_silentHookTried || !g_ready) return;
+    g_silentHookTried = true;
+    void *game = findImage(kGameImage);
+    void *k = game ? il2_class_from_name(game, "Chillow.StandChillow.Inventory.Gun", "GunController") : nullptr;
+    if (!k) { g_silentHookMsg = @"silent hook: GunController not found"; return; }
+    void *iter = nullptr, *m, *target = nullptr;
+    while ((m = il2_class_methods(k, &iter))) {
+        const char *mn = il2_method_name(m);
+        if (mn && !strcmp(mn, "xqp") && il2_method_pcount(m) == 3) { target = direct(m); break; }
+    }
+    if (!target) { g_silentHookMsg = @"silent hook: xqp not found (names change per build, re-run Dump shot methods)"; return; }
+    int r = DobbyHook(target, (dobby_dummy_func_t)hook_xqp, (dobby_dummy_func_t *)&orig_xqp);
+    g_silentHookOk = (r == 0 && orig_xqp);
+    g_silentHookMsg = g_silentHookOk ? @"silent hook: installed on GunController.xqp" : [NSString stringWithFormat:@"silent hook: DobbyHook failed (%d)", r];
+    NSLog(@"[SCESP] %@ target=%p", g_silentHookMsg, target);
 }
 // Runs on EVERY tick with the real elapsed time: first-order approach to the target, so the motion does not depend
 // on the tick rate (the run loop can wake several times per frame). Small cap on the angular speed = no snapping.
@@ -3338,6 +3386,7 @@ static BOOL g_panelClosing = NO;
                     for (auto &p : ps) { if (p.self) continue; others++; if (!isBotObj(p.obj)) allBots = false; }
                     applyNoSpread(meObj, g_set.nospread, others > 0 && allBots);
                     g_silentOffline = others > 0 && allBots;
+                    if (g_set.silent && !g_silentHookTried) installSilentHook();
                 }
                 applyBhop(meObj, g_set.bhop);
                 applyViewmodel(meObj);
