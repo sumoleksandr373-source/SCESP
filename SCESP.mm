@@ -2348,6 +2348,51 @@ static bool cbUpdate(void *cam, const std::vector<void *> &want) {
     return true;
 }
 
+// Second dump: ALL methods (obfuscated names included) of the shot-related classes, flagged when they take or return
+// Vector3 / Ray / RaycastHit, because the first dump's name filter found almost nothing.
+static NSString *dumpShotMethods() {
+    void *game = findImage(kGameImage);
+    if (!game) return @"game image not found";
+    typedef size_t (*f_cnt)(void *);              typedef void *(*f_cls)(void *, size_t);
+    typedef const char *(*f_nm)(void *);          typedef void *(*f_ret)(void *);
+    f_cnt  imgCount = (f_cnt)dlsym(RTLD_DEFAULT, "il2cpp_image_get_class_count");
+    f_cls  imgClass = (f_cls)dlsym(RTLD_DEFAULT, "il2cpp_image_get_class");
+    f_nm   cName    = (f_nm)dlsym(RTLD_DEFAULT, "il2cpp_class_get_name");
+    f_nm   cNs      = (f_nm)dlsym(RTLD_DEFAULT, "il2cpp_class_get_namespace");
+    f_ret  mRet     = (f_ret)dlsym(RTLD_DEFAULT, "il2cpp_method_get_return_type");
+    if (!imgCount || !imgClass || !cName || !cNs || !mRet) return @"il2cpp class enumeration API missing";
+    static const char *want[] = { "GunController", "Raycaster", "ShotDispertion", "WeaponController", "WeaponryController", "RecoilParameters" };
+    NSMutableString *out = [NSMutableString string];
+    size_t total = imgCount(game);
+    for (size_t i = 0; i < total && out.length < 70000; i++) {
+        void *k = imgClass(game, i);
+        if (!k) continue;
+        const char *cn = cName(k);
+        bool ok = false;
+        for (const char *w : want) if (cn && !strcmp(cn, w)) ok = true;
+        if (!ok) continue;
+        [out appendFormat:@"%s.%s\n", cNs(k), cn];
+        void *iter = nullptr, *m; int shown = 0;
+        while ((m = il2_class_methods(k, &iter)) && shown < 90) {
+            shown++;
+            NSMutableString *sig = [NSMutableString string];
+            bool vec = false;
+            uint32_t pc = il2_method_pcount(m);
+            for (uint32_t p = 0; p < pc; p++) {
+                const char *tn = il2_type_name(il2_method_param(m, p));
+                if (tn && (strstr(tn, "Vector3") || strstr(tn, "Ray") || strstr(tn, "RaycastHit"))) vec = true;
+                [sig appendFormat:@"%s%s", p ? ", " : "", tn ? tn : "?"];
+            }
+            const char *rn = il2_type_name(mRet(m));
+            if (rn && (strstr(rn, "Vector3") || strstr(rn, "Ray") || strstr(rn, "RaycastHit"))) vec = true;
+            void *fp = direct(m); Dl_info di; long rva = 0;
+            if (fp && dladdr(fp, &di)) rva = (long)((char *)fp - (char *)di.dli_fbase);
+            [out appendFormat:@"  %@%s %s(%@)  rva=0x%lx\n", vec ? @"* " : @"", rn ? rn : "?", il2_method_name(m), sig, rva];
+        }
+    }
+    return out.length ? out : @"nothing matched";
+}
+
 // ---- class/method dump (for finding the fire path) ----------------------------------------
 // Panel button "Dump fire path" (Aimbot tab; shows the text on screen, saves Documents/SCESP_dump.txt, also copies to clipboard): every class of the game image whose name looks shooting-related,
 // with the methods that look relevant: signature + RVA (address minus image base).
@@ -2810,6 +2855,7 @@ static SCNNode *buildAgentModel() {
         nlButton(b, @"Learn look fields", self, @selector(learnTapped));
         nlButton(b, @"Use dump fields", self, @selector(dumpFieldsTapped));
         nlButton(b, @"Dump fire path", self, @selector(dumpTapped));
+        nlButton(b, @"Dump shot methods", self, @selector(dumpShotTapped));
         _aimInfo = nlInfo(b, 44, 9);
         nlEnd(b);
 
@@ -3142,9 +3188,7 @@ static BOOL g_panelClosing = NO;
     bool waiting = hpLearnTap();
     [_hpBtn setTitle:waiting ? @"Hit a bot, tap" : @"Learn health" forState:UIControlStateNormal];
 }
-- (void)dumpTapped {
-    if (!g_ready) { _status.text = @"dump: game not ready yet"; return; }
-    NSString *d = dumpFirePath();
+- (void)showDump:(NSString *)d {
     UIPasteboard.generalPasteboard.string = d;                                   // may be invisible on your setup, so also:
     NSString *path = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"SCESP_dump.txt"];
     [d writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -3165,6 +3209,14 @@ static BOOL g_panelClosing = NO;
     x.frame = CGRectMake(x.frame.origin.x + tv.frame.origin.x, x.frame.origin.y + tv.frame.origin.y, x.frame.size.width, x.frame.size.height);
     _dumpView = tv; _dumpClose = x;
     _status.text = [NSString stringWithFormat:@"dump: %lu chars, on screen + Documents/SCESP_dump.txt", (unsigned long)d.length];
+}
+- (void)dumpTapped {
+    if (!g_ready) { _status.text = @"dump: game not ready yet"; return; }
+    [self showDump:dumpFirePath()];
+}
+- (void)dumpShotTapped {
+    if (!g_ready) { _status.text = @"dump: game not ready yet"; return; }
+    [self showDump:dumpShotMethods()];
 }
 - (void)dumpClose { [_dumpView removeFromSuperview]; [_dumpClose removeFromSuperview]; _dumpView = nil; _dumpClose = nil; }
 
