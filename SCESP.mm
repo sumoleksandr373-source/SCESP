@@ -297,6 +297,8 @@ struct Settings {
     float stretchAspect = 1.3333f;                      // width/height of the render target
 };
 static Settings g_set;
+static bool g_hookCrashed = false;        // previous launch died after the silent hook was installed -> silent is switched off
+static double g_hookInstallT = 0;
 static bool g_dirty = true;
 
 static UIColor *colorFor(int i, CGFloat a) {
@@ -378,6 +380,10 @@ static void loadSettings() {
     if (g_selectedAimPart < 0 || g_selectedAimPart >= kAimPartCount) g_selectedAimPart = kAimHead;
     g_set.vm = [d boolForKey:@"scesp_vm"];
     g_set.silent = [d boolForKey:@"scesp_silent"];
+    if ([d boolForKey:@"scesp_hookpending"]) {      // the last run installed the hook and never reached the "stable" mark
+        g_hookCrashed = true; g_set.silent = false;
+        [d setBool:NO forKey:@"scesp_hookpending"]; [d setBool:NO forKey:@"scesp_silent"]; [d synchronize];
+    }
     if ([d objectForKey:@"scesp_silfov"]) g_set.silentFov = [d floatForKey:@"scesp_silfov"];
     if (g_set.silentFov < 1.0f || g_set.silentFov > 60.0f) g_set.silentFov = 8.0f;
     for (int i = 0; i < 9; i++) {
@@ -1194,8 +1200,11 @@ static void installSilentHook() {
         if (mn && !strcmp(mn, "xqp") && il2_method_pcount(m) == 3) { target = direct(m); break; }
     }
     if (!target) { g_silentHookMsg = @"silent hook: xqp not found (names change per build, re-run Dump shot methods)"; return; }
+    { NSUserDefaults *ud = NSUserDefaults.standardUserDefaults; [ud setBool:YES forKey:@"scesp_hookpending"]; [ud synchronize]; }
+    g_hookInstallT = CACurrentMediaTime();
     int r = DobbyHook(target, (void *)hook_xqp, (void **)&orig_xqp);
     g_silentHookOk = (r == 0 && orig_xqp);
+    if (!g_silentHookOk) { g_hookInstallT = 0; [NSUserDefaults.standardUserDefaults setBool:NO forKey:@"scesp_hookpending"]; }
     g_silentHookMsg = g_silentHookOk ? @"silent hook: installed on GunController.xqp" : [NSString stringWithFormat:@"silent hook: DobbyHook failed (%d)", r];
     NSLog(@"[SCESP] %@ target=%p", g_silentHookMsg, target);
 }
@@ -3191,7 +3200,7 @@ static SCNNode *buildAgentModel() {
         case 25: g_set.vm = s.on; g_vmForce = true; break;
         case 26: g_set.stretch = s.on; g_stTries = 0; break;
         case 40: g_set.nospread = s.on; break;
-        case 41: g_set.silent = s.on; break;
+        case 41: g_set.silent = s.on; if (s.on) g_hookCrashed = false; break;
     }
     g_dirty = true; saveSettings();
 }
@@ -3393,7 +3402,10 @@ static BOOL g_panelClosing = NO;
                     for (auto &p : ps) { if (p.self) continue; others++; if (!isBotObj(p.obj)) allBots = false; }
                     applyNoSpread(meObj, g_set.nospread, others > 0 && allBots);
                     g_silentOffline = others > 0 && allBots;
-                    if (g_set.silent && !g_silentHookTried) installSilentHook();
+                    if (g_set.silent && !g_silentHookTried && meObj && g_silentOffline) installSilentHook();   // never in lobby / team select / loading
+                    if (g_hookInstallT > 0 && now - g_hookInstallT > 20.0) {   // survived 20 s -> not a crash-on-install
+                        g_hookInstallT = 0; [NSUserDefaults.standardUserDefaults setBool:NO forKey:@"scesp_hookpending"];
+                    }
                 }
                 applyBhop(meObj, g_set.bhop);
                 applyViewmodel(meObj);
@@ -3785,7 +3797,7 @@ static BOOL g_panelClosing = NO;
                                       : diagRenderer(diagR));
             _status.text = [_status.text stringByAppendingFormat:@"\n%@\n%@", l3, mi_hp ? (mi_armor ? @"hp: ode() | armor: odf()/odg()" : @"hp: PlayerController.ode() | armor: n/a") : g_hpMsg];
             _aimInfo.text = l3;
-            _silInfo.text = [NSString stringWithFormat:@"%@\n%@ | targets %zu\nshots seen %d, redirected %d", g_silentHookMsg,
+            _silInfo.text = [NSString stringWithFormat:@"%@\n%@ | targets %zu\nshots seen %d, redirected %d", g_hookCrashed ? @"silent: switched off, last run crashed after hook install (toggle to retry)" : g_silentHookMsg,
                              g_silentOffline ? @"bots-only match: OK" : @"waiting: needs a match with only bots", g_silentTargets.size(), g_silSeen, g_silApplied];
         } @catch (...) {}
     }
