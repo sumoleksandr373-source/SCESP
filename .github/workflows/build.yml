@@ -11,14 +11,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Build Dobby (static, iOS arm64)
+        run: |
+          git clone --depth 1 https://github.com/jmpews/Dobby.git
+          cmake -S Dobby -B Dobby/build-ios \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DCMAKE_BUILD_TYPE=Release -DDOBBY_GENERATE_SHARED=OFF
+          cmake --build Dobby/build-ios --config Release -j 4
+          find Dobby/build-ios -name "libdobby.a" | head -1 | xargs -I{} cp {} ./libdobby.a
+          ls -la libdobby.a
+
       - name: Compile libSCESP.dylib (iOS arm64)
         run: |
           xcrun -sdk iphoneos clang++ -std=c++17 -arch arm64 \
             -miphoneos-version-min=15.0 \
             -dynamiclib -fobjc-arc -O2 \
+            -IDobby/include \
             -install_name @rpath/libSCESP.dylib \
             -framework Foundation -framework UIKit -framework QuartzCore -framework SceneKit \
-            -o libSCESP.dylib SCESP.mm
+            -o libSCESP.dylib SCESP.mm libdobby.a -lc++
           file libSCESP.dylib
           ls -la libSCESP.dylib
 
