@@ -14,8 +14,10 @@ jobs:
       - name: Build Dobby (static, iOS arm64)
         run: |
           git clone --depth 1 https://github.com/jmpews/Dobby.git
+          sed -n 20,60p Dobby/cmake/build_environment_check.cmake || true
           cmake -S Dobby -B Dobby/build-ios \
-            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_SYSTEM_PROCESSOR=arm64 -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
             -DCMAKE_BUILD_TYPE=Release -DDOBBY_GENERATE_SHARED=OFF
           cmake --build Dobby/build-ios --config Release -j 4
