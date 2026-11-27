@@ -47,6 +47,7 @@
 #include <string>
 #include <algorithm>
 #include <math.h>
+#include "SilentAimCore.hpp"
 
 // ---- config ----------------------------------------------------------------------------
 static const char *kGameImage = "Chillow.StandChillow.Client.dll";
@@ -107,6 +108,8 @@ struct Settings {
     bool vm = false;        // custom hands position (game's CustomViewModel)
     float vmv[9] = { 0, 0, 0, 0, 0, 0, 0, -1, -1 };   // posX posY posZ rotX rotY rotZ addFov handsType(-1=keep) fovType(-1=keep)
     bool nospread = false;  // zero weapon spread/dispersion data (offline bot matches only)
+    bool silent = false;    // silent aim: rewrites the direction of each shot (offline bot matches only)
+    float silentFov = 8.0f; // silent aim capture cone, degrees
     bool stretch = false;   // stretched resolution
     float stretchAspect = 1.3333f;                      // width/height of the render target
 };
@@ -135,6 +138,7 @@ static void saveSettings() {
     [d setBool:g_set.hp forKey:@"scesp_hp"];
     [d setBool:g_set.hdot forKey:@"scesp_hdot"];
     [d setBool:g_set.nospread forKey:@"scesp_nsp"];
+    [d setBool:g_set.silent forKey:@"scesp_silent"]; [d setFloat:g_set.silentFov forKey:@"scesp_silfov"];
     [d setBool:g_set.bhop forKey:@"scesp_bhop"];
     [d setBool:g_set.bhopCustom forKey:@"scesp_bhcus"];
     [d setFloat:g_set.bhopStep forKey:@"scesp_bhstep"]; [d setFloat:g_set.bhopMax forKey:@"scesp_bhmax"]; [d setFloat:g_set.bhopReset forKey:@"scesp_bhrst"];
@@ -190,6 +194,9 @@ static void loadSettings() {
     g_selectedAimPart = (int)[d integerForKey:@"scesp_aim_part"];
     if (g_selectedAimPart < 0 || g_selectedAimPart >= kAimPartCount) g_selectedAimPart = kAimHead;
     g_set.vm = [d boolForKey:@"scesp_vm"];
+    g_set.silent = [d boolForKey:@"scesp_silent"];
+    if ([d objectForKey:@"scesp_silfov"]) g_set.silentFov = [d floatForKey:@"scesp_silfov"];
+    if (g_set.silentFov < 1.0f || g_set.silentFov > 60.0f) g_set.silentFov = 8.0f;
     for (int i = 0; i < 9; i++) {
         NSString *key = [NSString stringWithFormat:@"scesp_vm%d", i];
         if ([d objectForKey:key]) g_set.vmv[i] = [d floatForKey:key];
@@ -924,6 +931,43 @@ struct AimTg {
     uint8_t partCount[kAimPartCount];
 };
 static void *g_lockId = nullptr;         // target we are currently locked on (sticky, so we do not flick between bots)
+
+// ---- silent aim ------------------------------------------------------------------------
+// The tick fills the snapshot below once per frame (camera, view forward, enemy aim points).
+// The fire hook calls silentAimApply() right before the original shot call.
+static std::vector<silent_aim::Target> g_silentTargets;
+static silent_aim::Vec3 g_silentCam{}, g_silentFwd{};
+static bool g_silentOffline = false;     // set by the tick: other characters exist and all are bots
+static bool g_silentFresh = false;
+static void *g_silentLastId = nullptr;
+
+static inline silent_aim::Vec3 toSA(V3 v) { return { v.x, v.y, v.z }; }
+
+// direction: the shot direction the game is about to use (in/out).  shotOrigin: real muzzle / trace start.
+// aimKeyDown: pass true if the shot is always allowed to be redirected (the toggle itself is the gate).
+static bool silentAimApply(V3 shotOriginIn, V3 &directionInOut, bool aimKeyDown) {
+    if (!g_set.silent || !g_silentOffline || !g_silentFresh || g_silentTargets.empty()) return false;
+
+    silent_aim::ShotContext ctx{
+        g_silentCam,                 // cameraOrigin
+        toSA(shotOriginIn),          // shotOrigin
+        g_silentFwd,                 // viewForward
+        aimKeyDown                   // active
+    };
+    silent_aim::Settings settings;
+    settings.enabled = true;
+    settings.requireVisible = false; // the snapshot has no line-of-sight data
+    settings.maxFovDegrees = g_set.silentFov;
+    settings.maxDistance = 0.0f;
+
+    silent_aim::ShotSolution solution;
+    if (silent_aim::BuildSilentShot(ctx, g_silentTargets, settings, solution)) {
+        directionInOut = { solution.direction.x, solution.direction.y, solution.direction.z };
+        g_silentLastId = (void *)solution.entity;
+        return true;
+    }
+    return false;
+}
 // Runs on EVERY tick with the real elapsed time: first-order approach to the target, so the motion does not depend
 // on the tick rate (the run loop can wake several times per frame). Small cap on the angular speed = no snapping.
 // AimController -> AimingData (+0x80): curEulerAngles.y (+0x28) is the yaw, curAimAngle.x (+0x18) the pitch, in degrees
@@ -2123,7 +2167,7 @@ static bool cbUpdate(void *cam, const std::vector<void *> &want) {
 }
 
 // ---- class/method dump (for finding the fire path) ----------------------------------------
-// Panel button "Dump -> clipboard": every class of the game image whose name looks shooting-related,
+// Panel button "Dump fire path" (Aimbot tab; shows the text on screen, saves Documents/SCESP_dump.txt, also copies to clipboard): every class of the game image whose name looks shooting-related,
 // with the methods that look relevant: signature + RVA (address minus image base).
 static NSString *dumpFirePath() {
     void *game = findImage(kGameImage);
@@ -2460,6 +2504,7 @@ static SCNNode *buildAgentModel() {
     UIButton *_btn, *_hpBtn;
     UIView *_panel;
     UILabel *_status;
+    UITextView *_dumpView; UIButton *_dumpClose;
     UILabel *_lwLabel, *_hdLabel, *_fovLabel, *_spdLabel, *_aimInfo, *_tabTitle;
     UILabel *_bhStepLabel, *_bhMaxLabel, *_bhRstLabel, *_bhopInfo;
     NSMutableArray *_vmLabels;
@@ -2575,12 +2620,14 @@ static SCNNode *buildAgentModel() {
         NLCard a = nlCard(pg, @"Aim lock", 0, 0, CW);
         nlToggle(a, @"Enabled", 8, g_set.aim, self, @selector(swChanged:));
         nlToggle(a, @"Draw FOV", 15, g_set.drawFov, self, @selector(swChanged:));
+        nlToggle(a, @"Silent aim (bots)", 41, g_set.silent, self, @selector(swChanged:));
         _fovLabel = nlSlider(a, @"FOV", 13, 5, 90, g_set.fov, self, @selector(slChanged:));
         _spdLabel = nlSlider(a, @"Speed", 14, 4, 40, g_set.aimSpeed, self, @selector(slChanged:));
         nlEnd(a);
         NLCard b = nlCard(pg, @"Look fields", CW + 8, 0, CW);
         nlButton(b, @"Learn look fields", self, @selector(learnTapped));
         nlButton(b, @"Use dump fields", self, @selector(dumpFieldsTapped));
+        nlButton(b, @"Dump fire path", self, @selector(dumpTapped));
         _aimInfo = nlInfo(b, 44, 9);
         nlEnd(b);
 
@@ -2861,6 +2908,7 @@ static SCNNode *buildAgentModel() {
         case 25: g_set.vm = s.on; g_vmForce = true; break;
         case 26: g_set.stretch = s.on; g_stTries = 0; break;
         case 40: g_set.nospread = s.on; break;
+        case 41: g_set.silent = s.on; break;
     }
     g_dirty = true; saveSettings();
 }
@@ -2915,10 +2963,28 @@ static BOOL g_panelClosing = NO;
 - (void)dumpTapped {
     if (!g_ready) { _status.text = @"dump: game not ready yet"; return; }
     NSString *d = dumpFirePath();
-    UIPasteboard.generalPasteboard.string = d;
-    NSLog(@"[SCESP] dump (%lu chars) copied to clipboard\n%@", (unsigned long)d.length, d);
-    _status.text = [NSString stringWithFormat:@"dump copied: %lu chars", (unsigned long)d.length];
+    UIPasteboard.generalPasteboard.string = d;                                   // may be invisible on your setup, so also:
+    NSString *path = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"SCESP_dump.txt"];
+    [d writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSLog(@"[SCESP] dump (%lu chars) -> %@\n%@", (unsigned long)d.length, path, d);
+    UIView *host = _panel.superview ?: _panel;
+    if (_dumpView) [_dumpView removeFromSuperview];
+    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectInset(host.bounds, 12, 60)];
+    tv.backgroundColor = [NL_WIN colorWithAlphaComponent:0.98];
+    tv.textColor = UIColor.whiteColor; tv.font = [UIFont fontWithName:@"Menlo" size:9] ?: [UIFont systemFontOfSize:9];
+    tv.editable = NO; tv.selectable = YES; tv.text = d;
+    tv.layer.cornerRadius = 10; tv.layer.borderWidth = 1; tv.layer.borderColor = NL_BORDER.CGColor;
+    tv.textContainerInset = UIEdgeInsetsMake(34, 8, 8, 8);
+    UIButton *x = [UIButton buttonWithType:UIButtonTypeSystem];
+    x.frame = CGRectMake(tv.bounds.size.width - 70, 4, 64, 28);
+    [x setTitle:@"Close" forState:UIControlStateNormal];
+    [x addTarget:self action:@selector(dumpClose) forControlEvents:UIControlEventTouchUpInside];
+    [host addSubview:tv]; [host addSubview:x];
+    x.frame = CGRectOffset(x.frame, tv.frame.origin.x, tv.frame.origin.y);
+    _dumpView = tv; _dumpClose = x;
+    _status.text = [NSString stringWithFormat:@"dump: %lu chars, on screen + Documents/SCESP_dump.txt", (unsigned long)d.length];
 }
+- (void)dumpClose { [_dumpView removeFromSuperview]; [_dumpClose removeFromSuperview]; _dumpView = nil; _dumpClose = nil; }
 
 // Called from a run-loop observer that fires AFTER Unity's frame callback, so bone and camera
 // transforms are the ones of the frame that was just rendered (no one-frame lag).
@@ -3037,6 +3103,7 @@ static BOOL g_panelClosing = NO;
                     int others = 0; bool allBots = true;
                     for (auto &p : ps) { if (p.self) continue; others++; if (!isBotObj(p.obj)) allBots = false; }
                     applyNoSpread(meObj, g_set.nospread, others > 0 && allBots);
+                    g_silentOffline = others > 0 && allBots;
                 }
                 applyBhop(meObj, g_set.bhop);
                 applyViewmodel(meObj);
@@ -3247,6 +3314,22 @@ static BOOL g_panelClosing = NO;
                     float curPit = -asinf(fmaxf(-1.f, fminf(1.f, f.y))) * 57.29578f;
                     void *aimObj = localAim(meObj);
                     if (!aimObj) aimObj = nearestAim(camPos);          // fallback only
+                    {   // silent aim snapshot (read by silentAimApply from the fire hook)
+                        g_silentTargets.clear();
+                        if (g_set.silent && g_silentOffline) {
+                            g_silentCam = toSA(camPos); g_silentFwd = toSA(f);
+                            for (auto &t : tg) {
+                                V3 ap = t.pos;
+                                if (g_selectedAimPart >= 0 && g_selectedAimPart < kAimPartCount && t.partCount[g_selectedAimPart] > 0)
+                                    ap = t.partPos[g_selectedAimPart];
+                                silent_aim::Target st;
+                                st.entity = (std::uintptr_t)t.id; st.aimPoint = toSA(ap);
+                                st.alive = true; st.enemy = true; st.visible = true;   // tg already holds live enemies only
+                                g_silentTargets.push_back(st);
+                            }
+                        }
+                        g_silentFresh = true;
+                    }
                     if (g_learn) {
                         learnStep(meObj, aimObj, curYaw, curPit);
                         if (now - g_learnT0 > 6.0) learnFinish();
