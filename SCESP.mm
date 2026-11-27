@@ -3151,7 +3151,7 @@ static BOOL g_panelClosing = NO;
     NSLog(@"[SCESP] dump (%lu chars) -> %@\n%@", (unsigned long)d.length, path, d);
     UIView *host = _panel.superview ?: _panel;
     if (_dumpView) [_dumpView removeFromSuperview];
-    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectInset(host.bounds, 12, 60)];
+    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(12, 60, host.bounds.size.width - 24, host.bounds.size.height - 120)];
     tv.backgroundColor = [NL_WIN colorWithAlphaComponent:0.98];
     tv.textColor = UIColor.whiteColor; tv.font = [UIFont fontWithName:@"Menlo" size:9] ?: [UIFont systemFontOfSize:9];
     tv.editable = NO; tv.selectable = YES; tv.text = d;
@@ -3162,7 +3162,7 @@ static BOOL g_panelClosing = NO;
     [x setTitle:@"Close" forState:UIControlStateNormal];
     [x addTarget:self action:@selector(dumpClose) forControlEvents:UIControlEventTouchUpInside];
     [host addSubview:tv]; [host addSubview:x];
-    x.frame = CGRectOffset(x.frame, tv.frame.origin.x, tv.frame.origin.y);
+    x.frame = CGRectMake(x.frame.origin.x + tv.frame.origin.x, x.frame.origin.y + tv.frame.origin.y, x.frame.size.width, x.frame.size.height);
     _dumpView = tv; _dumpClose = x;
     _status.text = [NSString stringWithFormat:@"dump: %lu chars, on screen + Documents/SCESP_dump.txt", (unsigned long)d.length];
 }
