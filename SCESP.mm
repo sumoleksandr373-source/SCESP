@@ -1193,7 +1193,7 @@ static void installSilentHook() {
         if (mn && !strcmp(mn, "xqp") && il2_method_pcount(m) == 3) { target = direct(m); break; }
     }
     if (!target) { g_silentHookMsg = @"silent hook: xqp not found (names change per build, re-run Dump shot methods)"; return; }
-    int r = DobbyHook(target, (dobby_dummy_func_t)hook_xqp, (dobby_dummy_func_t *)&orig_xqp);
+    int r = DobbyHook(target, (void *)hook_xqp, (void **)&orig_xqp);
     g_silentHookOk = (r == 0 && orig_xqp);
     g_silentHookMsg = g_silentHookOk ? @"silent hook: installed on GunController.xqp" : [NSString stringWithFormat:@"silent hook: DobbyHook failed (%d)", r];
     NSLog(@"[SCESP] %@ target=%p", g_silentHookMsg, target);
