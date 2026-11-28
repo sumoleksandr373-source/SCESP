@@ -301,6 +301,8 @@ struct Settings {
 static Settings g_set;
 static bool g_hookCrashed = false;        // previous launch died after the silent hook was installed -> silent is switched off
 static double g_hookInstallT = 0;
+static bool g_hookUnsupported = false;    // DobbyHook returned an error on this device/launch method: do not try again until the toggle is flipped
+static inline bool silentWanted() { return g_set.silent && !g_hookUnsupported; }
 // Breadcrumbs written + fsync'ed immediately, so they survive a crash. The previous run's tail is shown on the Silent aim card.
 static NSString *g_prevTrace = @"";
 static FILE *g_traceF = nullptr;
@@ -403,6 +405,7 @@ static void loadSettings() {
     g_set.vm = [d boolForKey:@"scesp_vm"];
     g_set.silent = [d boolForKey:@"scesp_silent"];
     traceInit();
+    g_hookUnsupported = [d boolForKey:@"scesp_hookunsup"];
     if ([d boolForKey:@"scesp_hookpending"]) {      // the last run installed the hook and never reached the "stable" mark
         g_hookCrashed = true; g_set.silent = false;
         [d setBool:NO forKey:@"scesp_hookpending"]; [d setBool:NO forKey:@"scesp_silent"]; [d synchronize];
@@ -1240,7 +1243,12 @@ static void installSilentHook() {
     int r = DobbyHook(target, (void *)hook_xqp, (void **)&orig_xqp);
     trace([NSString stringWithFormat:@"install done r=%d orig=%p", r, (void *)orig_xqp]);
     g_silentHookOk = (r == 0 && orig_xqp);
-    if (!g_silentHookOk) { g_hookInstallT = 0; [NSUserDefaults.standardUserDefaults setBool:NO forKey:@"scesp_hookpending"]; }
+    if (!g_silentHookOk) {
+        g_hookInstallT = 0; g_hookUnsupported = true;
+        NSUserDefaults *ud = NSUserDefaults.standardUserDefaults; [ud setBool:NO forKey:@"scesp_hookpending"]; [ud setBool:YES forKey:@"scesp_hookunsup"]; [ud synchronize];
+        g_silentHookMsg = [NSString stringWithFormat:@"silent hook: DobbyHook returned %d, so this launch method cannot patch game code. Silent aim is paused (flip the toggle to retry once).", r];
+        return;
+    }
     g_silentHookMsg = g_silentHookOk ? @"silent hook: installed on GunController.xqp" : [NSString stringWithFormat:@"silent hook: DobbyHook failed (%d)", r];
     NSLog(@"[SCESP] %@ target=%p", g_silentHookMsg, target);
 }
@@ -3236,7 +3244,7 @@ static SCNNode *buildAgentModel() {
         case 25: g_set.vm = s.on; g_vmForce = true; break;
         case 26: g_set.stretch = s.on; g_stTries = 0; break;
         case 40: g_set.nospread = s.on; break;
-        case 41: g_set.silent = s.on; if (s.on) g_hookCrashed = false; break;
+        case 41: g_set.silent = s.on; if (s.on) { g_hookCrashed = false; if (g_hookUnsupported) { g_hookUnsupported = false; g_silentHookTried = false; [NSUserDefaults.standardUserDefaults setBool:NO forKey:@"scesp_hookunsup"]; } } break;
     }
     g_dirty = true; saveSettings();
 }
@@ -3400,8 +3408,8 @@ static BOOL g_panelClosing = NO;
     bool scanNow = false;
     void *diagR = nullptr;
 
-    if (g_set.on || g_set.silent) {
-        if (now - _lastScan > 1.0) { rescan(g_set.skel || g_set.chams || g_set.box || g_set.aim || g_set.silent); scanNow = true; _lastScan = now; }
+    if (g_set.on || silentWanted()) {
+        if (now - _lastScan > 1.0) { rescan(g_set.skel || g_set.chams || g_set.box || g_set.aim || silentWanted()); scanNow = true; _lastScan = now; }
         @try {
             void *cam = d_cam_main(mi_cam_main);
             int sw = d_sw(mi_sw), sh = d_sh(mi_sh);
@@ -3438,7 +3446,7 @@ static BOOL g_panelClosing = NO;
                     for (auto &p : ps) { if (p.self) continue; others++; if (!isBotObj(p.obj)) allBots = false; }
                     applyNoSpread(meObj, g_set.nospread, others > 0 && allBots);
                     g_silentOffline = others > 0 && allBots;
-                    if (g_set.silent && !g_silentHookTried && meObj && g_silentOffline) installSilentHook();   // never in lobby / team select / loading
+                    if (silentWanted() && !g_silentHookTried && meObj && g_silentOffline) installSilentHook();   // never in lobby / team select / loading
                     if (g_hookInstallT > 0 && now - g_hookInstallT > 20.0) {   // survived 20 s -> not a crash-on-install
                         g_hookInstallT = 0; [NSUserDefaults.standardUserDefaults setBool:NO forKey:@"scesp_hookpending"];
                     }
@@ -3492,7 +3500,7 @@ static BOOL g_panelClosing = NO;
                         if (y > maxY) maxY = y;
                     }
                     float hpv = 0;
-                    bool needHp = wantHp || ((mi_hp || g_haveHp) && (g_set.dmg || g_set.aim || g_set.silent));
+                    bool needHp = wantHp || ((mi_hp || g_haveHp) && (g_set.dmg || g_set.aim || silentWanted()));
                     bool hpOk = needHp && readHp(p.obj, &pi, hpv);
                     if (g_set.dmg && hpOk) {
                         if (g_hpPrev.size() > 128) g_hpPrev.clear();
@@ -3654,7 +3662,7 @@ static BOOL g_panelClosing = NO;
                     if (!aimObj) aimObj = nearestAim(camPos);          // fallback only
                     {   // silent aim snapshot (read by silentAimApply from the fire hook)
                         g_silentTargets.clear();
-                        if (g_set.silent && g_silentOffline) {
+                        if (silentWanted() && g_silentOffline) {
                             g_silentCam = toSA(camPos); g_silentFwd = toSA(f);
                             for (auto &t : tg) {
                                 V3 ap = t.pos;
